@@ -1,3 +1,13 @@
+/*
+ * Stremio addon: Animace pro děti (TMDB + ČSFD)
+ * Version 3.5.0
+ *
+ * Změna oproti 3.4.1:
+ * - český název a český popis z TMDB translations mají přednost,
+ * - CZDB/ČSFD český popis má stále nejvyšší prioritu,
+ * - angličtina je až poslední nouzová varianta.
+ */
+
 "use strict";
 
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
@@ -43,11 +53,11 @@ const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
-const META_SHORT_TTL_MS = 15 * 60 * 1000; // kratší cache, když ČSFD chybí
+const META_SHORT_TTL_MS = 15 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.4.1",
+    version: "3.5.0",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -286,12 +296,37 @@ async function findTmdbByImdb(imdbId) {
 async function getTmdbDetail(kind, tmdbId) {
     return await tmdb(`/${kind}/${tmdbId}`, {
         language: LANGUAGE,
-        append_to_response: "credits,external_ids"
+        append_to_response: "credits,external_ids,translations"
     });
 }
 
+// TMDB někdy vrátí překlady odděleně od hlavního language parametru.
+// Vždy proto zkusíme najít explicitní českou (cs) variantu.
+function getCzechTranslation(detail) {
+    const translations =
+        detail &&
+        detail.translations &&
+        Array.isArray(detail.translations.translations)
+            ? detail.translations.translations
+            : [];
+
+    const candidates = translations.filter(
+        (t) => t && String(t.iso_639_1 || "").toLowerCase() === "cs"
+    );
+
+    const preferred =
+        candidates.find((t) => String(t.iso_3166_1 || "").toUpperCase() === "CZ") ||
+        candidates[0];
+
+    if (!preferred || !preferred.data) return null;
+
+    return {
+        title: preferred.data.title || preferred.data.name || "",
+        overview: preferred.data.overview || ""
+    };
+}
+
 async function getCsfdData(imdbId) {
-    // CZDB dokumentace uvádí pro IMDb hledání endpoint /search?i=tt...
     const url = new URL(`${CZDB_BASE}/search`);
     url.searchParams.set("i", imdbId);
     const controller = new AbortController();
@@ -324,8 +359,6 @@ function normalizeRating(value) {
 function normalizeCsfdData(data) {
     if (!data || typeof data !== "object") return null;
 
-    // CZDB /search vrací výsledky v data.results[].
-    // Při přesném IMDb dotazu očekáváme první shodu.
     const item = Array.isArray(data.results) && data.results.length ? data.results[0] : data;
     if (!item || typeof item !== "object") return null;
 
@@ -339,8 +372,6 @@ function normalizeCsfdData(data) {
     return { rating, csfdUrl, description, title, uid, imdbRating, raw: item };
 }
 
-// Epizody seriálu. Bez pole "videos" Stremio nezobrazí žádné díly a seriál nejde přehrát.
-// ID dílů musí být ve tvaru tt...:řada:díl, aby jim rozuměly doplňky se streamy.
 async function getCinemetaVideos(imdbId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -464,8 +495,14 @@ builder.defineMetaHandler(async ({ type, id }) => {
             type === "series" ? getSeriesVideos(imdbId, detail) : Promise.resolve(undefined)
         ]);
         const csfd = normalizeCsfdData(csfdRaw);
+        const czechTranslation = getCzechTranslation(detail);
 
-        const tmdbDescription = detail.overview || found.item.overview || "";
+        const tmdbDescription =
+            (czechTranslation && czechTranslation.overview) ||
+            detail.overview ||
+            found.item.overview ||
+            "";
+
         const csfdDescription = csfd && csfd.description ? String(csfd.description) : "";
         const descriptionParts = [];
 
@@ -516,6 +553,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
             id: rawId,
             type,
             name:
+                (czechTranslation && czechTranslation.title) ||
+                (csfd && csfd.title) ||
                 detail.title ||
                 detail.name ||
                 found.item.title ||
@@ -548,7 +587,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 : undefined
         };
 
-        // Když ČSFD chybí (výpadek), drž výsledek jen krátce, ať se brzy zkusí znovu
         cacheMeta(cacheKey, meta, csfd ? STATE_TTL_MS : META_SHORT_TTL_MS);
 
         console.log(
