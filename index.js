@@ -50,15 +50,15 @@ const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
 const META_CACHE_MAX = 10000;
-const ADDON_ID_PREFIX = "flyers:";
+const ADDON_ID_PREFIX = "flyers424:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const META_SHORT_TTL_MS = 0;
 
 const manifest = {
-    id: "cz.flyerscze.animace.tmdb",
-    version: "4.2.1",
+    id: "cz.flyerscze.animace.tmdb.v424",
+    version: "4.2.4",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -349,6 +349,46 @@ async function getCsfdData(imdbId) {
     }
 }
 
+// Druhá cesta pro tituly, které CZDB nespojí přes IMDb.
+// ČSFD API umí hledat přímo podle názvu, takže nový nebo hůře propojený titul
+// (např. film, který ještě nemá správnou vazbu v CZDB) dostane stejnou šanci.
+async function findCsfdByTitle(title, year, originalTitle) {
+    const queries = [title, originalTitle].filter(Boolean)
+        .map((v) => String(v).trim())
+        .filter((v, i, a) => a.indexOf(v) === i);
+
+    for (const query of queries) {
+        try {
+            const result = await csfdApi.search(query);
+            const movies = [
+                ...(Array.isArray(result?.movies) ? result.movies : []),
+                ...(Array.isArray(result?.tvSeries) ? result.tvSeries : [])
+            ];
+            if (!movies.length) continue;
+
+            const wantedYear = year ? String(year) : "";
+            const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9áčďéěíňóřšťúůýž ]/gi, "").trim();
+            const exact = movies.find((m) => {
+                const mt = String(m.title || "").toLowerCase().trim();
+                const my = m.year ? String(m.year) : "";
+                return mt === normalizedQuery && (!wantedYear || !my || my === wantedYear);
+            });
+            const sameYear = wantedYear && movies.find((m) => String(m.year || "") === wantedYear);
+            const match = exact || sameYear || movies[0];
+            if (match && match.id) {
+                return {
+                    csfd_id: match.id,
+                    csfd_url: match.url || `https://www.csfd.cz/film/${match.id}/`,
+                    nazev: match.title || title
+                };
+            }
+        } catch (error) {
+            console.warn(`[ČSFD SEARCH] ${query}: ${error.message}`);
+        }
+    }
+    return null;
+}
+
 // Aktuální ČSFD rating získáváme přes ověřenou knihovnu node-csfd-api.
 // CZDB používáme dál pro propojení přes IMDb a pro česká metadata.
 async function getCsfdLibraryData(csfdId) {
@@ -561,12 +601,33 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const detail = await getTmdbDetail(found.kind, found.item.id);
         if (!detail) return { meta: null };
 
+        const czechTranslation = getCzechTranslation(detail);
+
         const [csfdRaw, videos] = await Promise.all([
             getCsfdData(imdbId),
             type === "series" ? getSeriesVideos(imdbId, detail) : Promise.resolve(undefined)
         ]);
 
         let csfd = normalizeCsfdData(csfdRaw);
+
+        // Fallback: pokud CZDB nenajde vazbu přes IMDb, dohledáme ČSFD přímo
+        // podle názvu a roku. Tím se sjednotí dostupnost ratingu i u titulů,
+        // které v CZDB nemají správně vyplněné IMDb propojení.
+        if (!csfd || !csfd.uid) {
+            const titleForSearch =
+                (czechTranslation && czechTranslation.title) ||
+                detail.title ||
+                detail.name ||
+                found.item.title ||
+                found.item.name ||
+                "";
+            const originalTitle = detail.original_title || detail.original_name || found.item.original_title || found.item.original_name || "";
+            const yearForSearch = String(
+                detail.release_date || detail.first_air_date || found.item.release_date || found.item.first_air_date || ""
+            ).slice(0, 4);
+            const searched = await findCsfdByTitle(titleForSearch, yearForSearch, originalTitle);
+            if (searched) csfd = normalizeCsfdData(searched);
+        }
 
         // ČSFD hodnocení bereme přednostně z aktuálních dat ČSFD podle jejího ID.
         // Tím opravíme případy, kdy CZDB vrací 0 nebo zastaralé procento.
@@ -587,8 +648,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 csfd.rating = directRating;
             }
         }
-
-        const czechTranslation = getCzechTranslation(detail);
 
         const tmdbDescription =
             (czechTranslation && czechTranslation.overview) ||

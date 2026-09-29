@@ -1,6 +1,6 @@
 {
   "name": "animace-tmdb-stremio-addon",
-  "version": "4.2.1",
+  "version": "4.2.4",
   "description": "Dětské animované filmy a seriály z TMDB pro Stremio (bez anime) s českým detailem a ČSFD",
   "main": "index.js",
   "scripts": {
