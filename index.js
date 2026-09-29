@@ -44,7 +44,7 @@ const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.2.0",
+    version: "3.3.0",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
     resources: [
