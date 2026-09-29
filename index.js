@@ -29,7 +29,9 @@ const MAX_BATCHES_PER_REQUEST = 8;
 const MAX_TMDB_PAGES = 500;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
-const PREHRAJTO_TIMEOUT_MS = 7000;
+const PREHRAJTO_TIMEOUT_MS = 9000;
+const PREHRAJTO_USERNAME = process.env.PREHRAJTO_USERNAME || "";
+const PREHRAJTO_PASSWORD = process.env.PREHRAJTO_PASSWORD || "";
 const CZ_DABING_CACHE_MAX = 5000;
 const CZ_DABING_TTL_MS = 6 * 60 * 60 * 1000;
 const RETRIES = 2;
@@ -39,7 +41,7 @@ const OVERVIEW_TTL_MS = 12 * 60 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.5",
+    version: "3.0.6",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
     resources: [
@@ -278,8 +280,95 @@ function czDabingCacheSet(key, value) {
 }
 
 function hasCzechDubbingTitle(title) {
-    const text = String(title || "").toLowerCase();
-    return /(?:^|[\s._\-\[(])(?:cz|cze)(?:[\s._\-\])]|$)|(?:česk(?:y|ý|á)|cz)\s*dab(?:ing|bed)?|\bcz\s*dab/.test(text);
+    const text = String(title || "")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/&amp;/gi, "&")
+        .toLowerCase();
+
+    return /(?:^|[\s._\-\[(])(?:cz|cze)(?:[\s._\-\])]|$)|česk(?:ý|y|á)\s*dab(?:ing|bed)?|\bcz\s*dab(?:ing|bed)?/.test(text);
+}
+
+let prehrajtoCookies = null;
+let prehrajtoCookiesAt = 0;
+
+function extractSetCookies(headers) {
+    if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
+    const one = headers.get("set-cookie");
+    return one ? [one] : [];
+}
+
+function cookieHeader(setCookies) {
+    return setCookies
+        .map(v => String(v).split(";", 1)[0])
+        .filter(Boolean)
+        .join("; ");
+}
+
+async function getPrehrajtoHeaders() {
+    const common = {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: "https://prehraj.to/"
+    };
+
+    if (!PREHRAJTO_USERNAME || !PREHRAJTO_PASSWORD) return common;
+    if (prehrajtoCookies && Date.now() - prehrajtoCookiesAt < 8_400_000) {
+        return { ...common, Cookie: prehrajtoCookies };
+    }
+
+    const home = await fetch("https://prehraj.to/", { headers: common });
+    const initial = cookieHeader(extractSetCookies(home.headers));
+
+    const form = new URLSearchParams();
+    form.set("email", PREHRAJTO_USERNAME);
+    form.set("password", PREHRAJTO_PASSWORD);
+    form.set("remember_login", "on");
+    form.set("_do", "loginDialog-login-loginForm-submit");
+    form.set("login", "Přihlásit se");
+
+    const login = await fetch("https://prehraj.to/?frm=loginDialog-login-loginForm", {
+        method: "POST",
+        headers: {
+            ...common,
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            ...(initial ? { Cookie: initial } : {})
+        },
+        body: form.toString()
+    });
+
+    const cookies = extractSetCookies(login.headers);
+    const combined = cookieHeader([
+        ...(initial ? initial.split(/;\s*/) : []),
+        ...cookies
+    ]);
+
+    if (!combined) throw new Error("Přihlášení na PřeHraj.to nevrátilo cookies");
+    prehrajtoCookies = combined;
+    prehrajtoCookiesAt = Date.now();
+    return { ...common, Cookie: combined };
+}
+
+function extractVideoTitles(html) {
+    const titles = [];
+    const anchorRe = /<a\b([^>]*class=["'][^"']*video--link[^"'][^>]*|[^>]*video--link[^>]*class=["'][^"']*video--link[^"'][^>]*?)>/gi;
+    let m;
+    while ((m = anchorRe.exec(html))) {
+        const attrs = m[1];
+        const titleMatch = attrs.match(/\btitle=["']([^"']*)["']/i);
+        if (titleMatch) titles.push(titleMatch[1]);
+    }
+
+    // Fallback for HTML where the attribute order/class formatting differs.
+    if (!titles.length) {
+        for (const m2 of html.matchAll(/<a\b([^>]*video--link[^>]*)>/gi)) {
+            const titleMatch = m2[1].match(/\btitle=["']([^"']*)["']/i);
+            if (titleMatch) titles.push(titleMatch[1]);
+        }
+    }
+    return titles;
 }
 
 async function prehrajtoHasCzechDubbing(title, year) {
@@ -292,18 +381,17 @@ async function prehrajtoHasCzechDubbing(title, year) {
     try {
         const query = `${title}${year ? ` ${year}` : ""}`;
         const url = `https://prehraj.to/hledej/${encodeURIComponent(query)}?vp-page=0`;
-        const res = await fetch(url, {
-            headers: {
-                Accept: "text/html,application/xhtml+xml",
-                "User-Agent": "Mozilla/5.0"
-            },
-            signal: controller.signal
-        });
-        if (!res.ok) return false;
+        const headers = await getPrehrajtoHeaders();
+        const res = await fetch(url, { headers, signal: controller.signal });
+        if (!res.ok) {
+            log(`[CZ-DABING] ${title}: PřeHraj.to HTTP ${res.status}`);
+            czDabingCacheSet(key, false);
+            return false;
+        }
         const html = await res.text();
-        const titleMatches = [...html.matchAll(/<a[^>]*class=["'][^"']*video--link[^"']*["'][^>]*title=["']([^"']+)["'][^>]*>/gi)]
-            .map(m => m[1]);
-        const result = titleMatches.some(hasCzechDubbingTitle);
+        const titles = extractVideoTitles(html);
+        const result = titles.some(hasCzechDubbingTitle);
+        log(`[CZ-DABING] ${title}: ${result ? "ANO" : "NE"} (${titles.slice(0, 5).join(" | ")})`);
         czDabingCacheSet(key, result);
         return result;
     } catch (err) {
@@ -381,14 +469,18 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         const baseDef = CATALOGS.deti_filmy_nove;
         const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
         const state = getState(id);
-        let failed = false;
         try {
-            await ensure(state, baseDef, Math.min(skip + PAGE_SIZE, 80));
-            const candidates = state.items.slice(0, Math.min(state.items.length, 80));
-            const checked = await mapLimit(candidates, 4, async (item) => {
+            // Check enough newest TMDB candidates to find a useful number of
+            // titles that are actually marked CZ DABING on PřeHraj.to.
+            const target = Math.min(skip + PAGE_SIZE, 200);
+            await ensure(state, baseDef, target);
+
+            const candidates = state.items.slice(0, Math.min(state.items.length, 200));
+            const checked = await mapLimit(candidates, 3, async (item) => {
                 const year = item.releaseInfo || "";
                 return await prehrajtoHasCzechDubbing(item.name, year) ? item : null;
             });
+
             const metas = checked.filter(Boolean).slice(skip, skip + PAGE_SIZE);
             return {
                 metas,
@@ -397,7 +489,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
                 staleError: 7 * 24 * 60 * 60
             };
         } catch (err) {
-            failed = true;
             error(`[CZ-DABING] ${id}: ${err.message}`);
             return { metas: [], cacheMaxAge: 60 };
         }
