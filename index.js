@@ -6,8 +6,14 @@ const PORT = process.env.PORT || 7000;
 const TMDB_KEY = process.env.TMDB_API_KEY || "";
 const TMDB = "https://api.themoviedb.org/3";
 const IMG = "https://image.tmdb.org/t/p";
+const CINEMETA_BASE = process.env.CINEMETA_BASE || "https://v3-cinemeta.strem.io";
 const LANGUAGE = process.env.LANGUAGE || "cs-CZ";
 const MAX_RATING = process.env.MAX_RATING || "PG";
+const DEBUG = process.env.DEBUG === "1" || process.env.DEBUG === "true";
+
+const log = (...args) => { if (DEBUG) console.log(...args); };
+const warn = (...args) => console.warn(...args);
+const error = (...args) => console.error(...args);
 
 const list = (value, fallback) =>
     (value === undefined ? fallback : value).split(",").map(s => s.trim()).filter(Boolean);
@@ -19,34 +25,40 @@ const EXCLUDE_TV_GENRES = process.env.EXCLUDE_TV_GENRES !== undefined ? process.
 
 const PAGE_SIZE = 40;
 const PAGES_PER_BATCH = 5;
-const MAX_BATCHES_PER_REQUEST = 20;
+const MAX_BATCHES_PER_REQUEST = 8;
 const MAX_TMDB_PAGES = 500;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
 const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
+const OVERVIEW_CACHE_MAX = 5000;
+const OVERVIEW_TTL_MS = 12 * 60 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.0",
+    version: "3.0.4",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
-    resources: ["catalog"],
+    resources: [
+        "catalog",
+        { name: "meta", types: ["movie", "series"], idPrefixes: ["tt"] }
+    ],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
+    behaviorHints: { configurable: false },
     catalogs: [
-        { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
-        { type: "series", id: "deti_serialy_popularni", name: "📺 Animované seriály: Populární", extra: [{ name: "skip" }] },
-        { type: "series", id: "deti_serialy_nove", name: "🆕 Animované seriály: Nejnovější", extra: [{ name: "skip" }] }
+        { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
+        { type: "series", id: "deti_serialy_nove", name: "🆕 Animované seriály: Nejnovější", extra: [{ name: "skip" }] },
+        { type: "series", id: "deti_serialy_popularni", name: "📺 Animované seriály: Populární", extra: [{ name: "skip" }] }
     ]
 };
 
 const CATALOGS = {
-    deti_filmy_popularni: { type: "movie", kind: "movie", sort: "popularity.desc", minVotes: 20 },
-    deti_filmy_nove: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 10 },
-    deti_serialy_popularni: { type: "series", kind: "tv", sort: "popularity.desc", minVotes: 20 },
-    deti_serialy_nove: { type: "series", kind: "tv", sort: "first_air_date.desc", minVotes: 10 }
+    deti_filmy_popularni: { type: "movie", kind: "movie", sort: "popularity.desc", minVotes: 30 },
+    deti_filmy_nove: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 20 },
+    deti_serialy_popularni: { type: "series", kind: "tv", sort: "popularity.desc", minVotes: 30 },
+    deti_serialy_nove: { type: "series", kind: "tv", sort: "first_air_date.desc", minVotes: 20 }
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -89,9 +101,9 @@ async function tmdb(path, params = {}) {
             }
             if (!res.ok) throw new Error(`TMDB HTTP ${res.status}`);
             return await res.json();
-        } catch (error) {
-            lastError = error;
-            if (error.fatal) throw error;
+        } catch (err) {
+            lastError = err;
+            if (err.fatal) throw err;
             if (attempt < RETRIES) await sleep(400 * (attempt + 1));
         } finally {
             clearTimeout(timer);
@@ -109,13 +121,27 @@ async function getImdbId(kind, tmdbId) {
     try {
         const data = await tmdb(`/${kind}/${tmdbId}/external_ids`);
         imdb = (data && data.imdb_id) || null;
-    } catch (error) {
-        if (error.fatal) throw error;
+    } catch (err) {
+        if (err.fatal) throw err;
         return null;
     }
     if (imdbCache.size >= IMDB_CACHE_MAX) imdbCache.delete(imdbCache.keys().next().value);
     imdbCache.set(key, imdb);
     return imdb;
+}
+
+const overviewCache = new Map();
+
+function overviewGet(key) {
+    const entry = overviewCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.exp) { overviewCache.delete(key); return undefined; }
+    return entry.value;
+}
+
+function overviewSet(key, value) {
+    if (overviewCache.size >= OVERVIEW_CACHE_MAX) overviewCache.delete(overviewCache.keys().next().value);
+    overviewCache.set(key, { value, exp: Date.now() + OVERVIEW_TTL_MS });
 }
 
 function discoverParams(def, page) {
@@ -169,7 +195,16 @@ const states = new Map();
 function getState(id) {
     let s = states.get(id);
     if (!s || Date.now() - s.created > STATE_TTL_MS) {
-        s = { created: Date.now(), items: [], seen: new Set(), nextPage: 1, totalPages: MAX_TMDB_PAGES, done: false, lock: Promise.resolve() };
+        s = {
+            created: Date.now(),
+            items: [],
+            seen: new Set(),
+            nextPage: 1,
+            totalPages: MAX_TMDB_PAGES,
+            done: false,
+            fatal: false,
+            lock: Promise.resolve()
+        };
         states.set(id, s);
     }
     return s;
@@ -195,39 +230,98 @@ async function loadBatch(state, def) {
     });
     state.nextPage = last + 1;
     if (state.nextPage > state.totalPages) state.done = true;
-    console.log(`[OK] ${def.kind} stránky ${first}-${last}, celkem ${state.items.length} položek`);
+    log(`[OK] ${def.kind} stránky ${first}-${last}, celkem ${state.items.length} položek`);
 }
 
 function ensure(state, def, needed) {
+    if (state.fatal) return Promise.resolve();
     const run = state.lock.then(async () => {
+        if (state.fatal) return;
         let batches = 0;
         while (state.items.length < needed && !state.done && batches < MAX_BATCHES_PER_REQUEST) {
             await loadBatch(state, def);
             batches++;
         }
     });
-    state.lock = run.catch(() => {});
+    state.lock = run.catch(err => {
+        if (err && err.fatal) {
+            state.fatal = true;
+            error(`[FATAL] ${def.kind}: ${err.message}`);
+        }
+    });
     return run;
 }
 
 const builder = new addonBuilder(manifest);
 
+async function getCzechOverview(imdbId, type) {
+    if (!TMDB_KEY || !imdbId) return null;
+
+    const cached = overviewGet(imdbId);
+    if (cached !== undefined) return cached;
+
+    let result = null;
+    try {
+        const found = await tmdb(`/find/${encodeURIComponent(imdbId)}`, {
+            external_source: "imdb_id",
+            language: LANGUAGE
+        });
+
+        const item = type === "movie"
+            ? (found && found.movie_results && found.movie_results[0])
+            : (found && found.tv_results && found.tv_results[0]);
+
+        if (item && item.id) {
+            const detailPath = type === "movie" ? `/movie/${item.id}` : `/tv/${item.id}`;
+            const detail = await tmdb(detailPath, {
+                language: LANGUAGE,
+                append_to_response: "translations"
+            });
+
+            if (detail && detail.overview && detail.overview.trim()) {
+                result = detail.overview.trim();
+            } else {
+                const translations = detail && detail.translations && detail.translations.translations;
+                if (Array.isArray(translations)) {
+                    const cs = translations.find(t =>
+                        t && t.iso_639_1 === "cs" &&
+                        (!t.iso_3166_1 || t.iso_3166_1 === "CZ") &&
+                        t.data && t.data.overview
+                    );
+                    if (cs && cs.data.overview.trim()) result = cs.data.overview.trim();
+                }
+            }
+
+            if (!result && item.overview && item.overview.trim()) {
+                result = item.overview.trim();
+            }
+        }
+    } catch (err) {
+        if (err.fatal) throw err;
+        log(`[CZ-OVERVIEW] ${imdbId}: ${err.message}`);
+        return null;
+    }
+
+    overviewSet(imdbId, result);
+    return result;
+}
+
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     const def = CATALOGS[id];
     if (!def || def.type !== type) return { metas: [] };
     if (!TMDB_KEY) {
-        console.error("[CHYBA] Chybí proměnná prostředí TMDB_API_KEY");
+        error("[CHYBA] Chybí proměnná prostředí TMDB_API_KEY");
         return { metas: [], cacheMaxAge: 60 };
     }
     const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
-    console.log(`Požadavek: ${id} skip=${skip}`);
+    log(`Požadavek: ${id} skip=${skip}`);
     const state = getState(id);
     let failed = false;
     try {
         await ensure(state, def, skip + PAGE_SIZE);
-    } catch (error) {
+    } catch (err) {
         failed = true;
-        console.error(`[SELHÁNÍ] ${id}: ${error.message}`);
+        error(`[SELHÁNÍ] ${id}: ${err.message}`);
     }
     const metas = state.items.slice(skip, skip + PAGE_SIZE);
     return {
@@ -238,6 +332,32 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     };
 });
 
+builder.defineMetaHandler(async ({ type, id }) => {
+    try {
+        const cinemetaUrl = `${CINEMETA_BASE}/meta/${type}/${encodeURIComponent(id)}.json`;
+        const res = await fetch(cinemetaUrl);
+        if (!res.ok) return {};
+
+        const data = await res.json();
+        const meta = data && data.meta ? { ...data.meta } : {};
+        if (!meta.id) meta.id = id;
+        if (!meta.type) meta.type = type;
+
+        const czechOverview = await getCzechOverview(id, type);
+        if (czechOverview) meta.description = czechOverview;
+
+        return {
+            meta,
+            cacheMaxAge: 60 * 60,
+            staleRevalidate: 24 * 60 * 60,
+            staleError: 7 * 24 * 60 * 60
+        };
+    } catch (err) {
+        error(`[META] ${type}/${id}: ${err.message}`);
+        return {};
+    }
+});
+
 serveHTTP(builder.getInterface(), { port: PORT });
 console.log(`Doplněk běží na http://localhost:${PORT}/manifest.json`);
-if (!TMDB_KEY) console.warn("Upozornění: TMDB_API_KEY není nastaven, katalogy budou prázdné.");
+if (!TMDB_KEY) warn("Upozornění: TMDB_API_KEY není nastaven, katalogy budou prázdné.");
