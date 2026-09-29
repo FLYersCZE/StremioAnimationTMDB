@@ -29,7 +29,9 @@ const MAX_BATCHES_PER_REQUEST = 8;
 const MAX_TMDB_PAGES = 500;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
-const PREHRAJTO_TIMEOUT_MS = 9000;
+const PREHRAJTO_TIMEOUT_MS = 5000;
+const CZ_DABING_CANDIDATES = 20;
+const CZ_DABING_CONCURRENCY = 12;
 const PREHRAJTO_USERNAME = process.env.PREHRAJTO_USERNAME || "";
 const PREHRAJTO_PASSWORD = process.env.PREHRAJTO_PASSWORD || "";
 const CZ_DABING_CACHE_MAX = 5000;
@@ -41,11 +43,12 @@ const OVERVIEW_TTL_MS = 12 * 60 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.8",
+    version: "3.1.0",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
     resources: [
         "catalog",
+        "stream",
         { name: "meta", types: ["movie", "series"], idPrefixes: ["tt"] }
     ],
     types: ["movie", "series"],
@@ -286,7 +289,11 @@ function hasCzechDubbingTitle(title) {
         .replace(/&amp;/gi, "&")
         .toLowerCase();
 
-    return /(?:^|[\s._\-\[(])(?:cz|cze)(?:[\s._\-\])]|$)|česk(?:ý|y|á)\s*dab(?:ing|bed)?|\bcz\s*dab(?:ing|bed)?/.test(text);
+    // Pouze skutečný dabing. Samotné "CZ" nestačí a české titulky nejsou dabing.
+    if (/(?:cz|cze)[\s._-]*titulky|česk(?:é|e)\s*titulky/.test(text)) return false;
+    if (/(?:^|[\s._\-\[\](){}])(?:cz|cze)[\s._\-:]*dab(?:ing|bed|ín)?(?:[\s._\-\[\](){}]|$)/.test(text)) return true;
+    if (/česk(?:ý|y|á|é)\s*(?:dab(?:ing|bed|ín)?|znění)/.test(text)) return true;
+    return false;
 }
 
 let prehrajtoCookies = null;
@@ -380,6 +387,61 @@ function extractVideoTitles(html) {
     return titles;
 }
 
+function extractVideoResults(html) {
+    const results = [];
+    for (const match of String(html || "").matchAll(/<a\b([^>]*class=["'][^"']*\bvideo--link\b[^"']*["'][^>]*)>/gi)) {
+        const attrs = match[1];
+        const titleMatch = attrs.match(/\btitle=["']([^"']*)["']/i);
+        const hrefMatch = attrs.match(/\bhref=["']([^"']+)["']/i);
+        if (titleMatch && hrefMatch) {
+            results.push({ title: decodeHtml(titleMatch[1]).trim(), href: hrefMatch[1] });
+        }
+    }
+    return results;
+}
+
+async function prehrajtoSearchResults(query, headers) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
+    try {
+        const url = `https://prehraj.to/hledej/${encodeURIComponent(query)}?vp-page=0`;
+        const res = await fetch(url, { headers, signal: controller.signal });
+        if (!res.ok) return null;
+        return extractVideoResults(await res.text());
+    } catch (err) {
+        log(`[CZ-DABING] search: ${err.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function prehrajtoResolveVideo(path, headers) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
+    try {
+        const url = path.startsWith("http") ? path : `https://prehraj.to${path}`;
+        const res = await fetch(url, { headers, signal: controller.signal });
+        if (!res.ok) return null;
+        const html = await res.text();
+        const m = html.match(/var\s+sources\s*=\s*(\[[\s\S]*?\])\s*;/i);
+        if (m) {
+            try {
+                const items = Function("return " + m[1])();
+                const video = Array.isArray(items) && items.length ? items[items.length - 1].file : null;
+                if (video) return video;
+            } catch {}
+        }
+        const fallback = html.match(/src:\s*["'](https?:\/\/[^"']+)["']/i);
+        return fallback ? fallback[1] : null;
+    } catch (err) {
+        log(`[CZ-DABING] resolve: ${err.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function prehrajtoSearchTitles(query, headers) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
@@ -400,14 +462,14 @@ async function prehrajtoSearchTitles(query, headers) {
     }
 }
 
-async function prehrajtoHasCzechDubbing(title, year) {
-    const key = `${String(title).toLowerCase()}|${year || ""}`;
+async function prehrajtoHasCzechDubbing(title, year, quick = false) {
+    const key = String(title).toLowerCase() + "|" + (year || "") + "|" + (quick ? "q" : "f");
     const cached = czDabingCacheGet(key);
     if (cached !== undefined) return cached;
 
     try {
         const headers = await getPrehrajtoHeaders();
-        const queries = year ? [`${title} ${year}`, title] : [title];
+        const queries = quick ? [title] : (year ? [title + " " + year, title] : [title]);
         let anySuccess = false;
 
         for (const query of queries) {
@@ -415,7 +477,7 @@ async function prehrajtoHasCzechDubbing(title, year) {
             if (titles === null) continue;
             anySuccess = true;
             const result = titles.some(hasCzechDubbingTitle);
-            log(`[CZ-DABING] ${title}: ${result ? "ANO" : "NE"} přes "${query}" (${titles.slice(0, 5).join(" | ")})`);
+            log("[CZ-DABING] " + title + ": " + (result ? "ANO" : "NE") + " přes \"" + query + "\" (" + titles.slice(0, 5).join(" | ") + ")");
             if (result) {
                 czDabingCacheSet(key, true);
                 return true;
@@ -425,7 +487,7 @@ async function prehrajtoHasCzechDubbing(title, year) {
         if (anySuccess) czDabingCacheSet(key, false);
         return false;
     } catch (err) {
-        log(`[CZ-DABING] ${title}: ${err.message}`);
+        log("[CZ-DABING] " + title + ": " + err.message);
         return false;
     }
 }
@@ -494,37 +556,20 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
     log(`Požadavek: ${id} skip=${skip}`);
     if (id === "deti_filmy_cz_dabing") {
-        const baseDef = CATALOGS.deti_filmy_nove;
-        const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
-        const state = getState(id);
+        // Tento katalog je záměrně úplně stejný jako „Nejnovější“.
+        // Ověření CZ dabingu se provede až po otevření konkrétního filmu
+        // ve stream handleru, takže katalog se nikdy nezasekne na PřeHraj.to.
+        const state = getState("deti_filmy_nove");
         try {
-            // Check enough newest TMDB candidates to find a useful number of
-            // titles that are actually marked CZ DABING on PřeHraj.to.
-            const target = Math.min(skip + PAGE_SIZE, 40);
-            await ensure(state, baseDef, target);
-
-            // Neomezujeme se jen na úplně nové filmy. CZ dabing je častý i u
-            // starších animáků, proto přidáme kandidáty z populárního katalogu.
-            const popularState = getState("deti_filmy_popularni");
-            await ensure(popularState, CATALOGS.deti_filmy_popularni, 40);
-            const byId = new Map();
-            for (const item of state.items.slice(0, 40)) byId.set(item.id, item);
-            for (const item of popularState.items.slice(0, 40)) byId.set(item.id, item);
-            const candidates = Array.from(byId.values());
-            const checked = await mapLimit(candidates, 6, async (item) => {
-                const year = item.releaseInfo || "";
-                return await prehrajtoHasCzechDubbing(item.name, year) ? item : null;
-            });
-
-            const metas = checked.filter(Boolean).slice(skip, skip + PAGE_SIZE);
+            await ensure(state, CATALOGS.deti_filmy_nove, skip + PAGE_SIZE);
             return {
-                metas,
-                cacheMaxAge: 6 * 60 * 60,
+                metas: state.items.slice(skip, skip + PAGE_SIZE),
+                cacheMaxAge: 60 * 60,
                 staleRevalidate: 24 * 60 * 60,
                 staleError: 7 * 24 * 60 * 60
             };
         } catch (err) {
-            error(`[CZ-DABING] ${id}: ${err.message}`);
+            error("[CZ-DABING] " + id + ": " + err.message);
             return { metas: [], cacheMaxAge: 60 };
         }
     }
@@ -544,6 +589,49 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         staleRevalidate: 24 * 60 * 60,
         staleError: 7 * 24 * 60 * 60
     };
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+    try {
+        if (type !== "movie" || !id || !id.startsWith("tt")) return { streams: [] };
+
+        const cinemetaUrl = `${CINEMETA_BASE}/meta/${type}/${encodeURIComponent(id)}.json`;
+        const metaRes = await fetch(cinemetaUrl);
+        if (!metaRes.ok) return { streams: [] };
+        const metaData = await metaRes.json();
+        const title = metaData && metaData.meta && metaData.meta.name;
+        if (!title) return { streams: [] };
+
+        const headers = await getPrehrajtoHeaders();
+        const results = await prehrajtoSearchResults(title, headers);
+        if (!results) return { streams: [] };
+
+        // Tady se provádí skutečný filtr. Dítě se k tomuto ověření dostane
+        // až po otevření filmu; katalog předem nic nekontroluje.
+        const czResults = results.filter(item => hasCzechDubbingTitle(item.title));
+        if (!czResults.length) {
+            log(`[CZ-DABING] ${title}: žádný CZ dabing`);
+            return { streams: [] };
+        }
+
+        const resolved = [];
+        for (const item of czResults.slice(0, 5)) {
+            const video = await prehrajtoResolveVideo(item.href, headers);
+            if (video) {
+                resolved.push({
+                    url: video,
+                    name: "🇨🇿 PřeHraj.to",
+                    description: item.title,
+                    behaviorHints: { filename: item.title, bingeGroup: "prehrajto-cz" }
+                });
+            }
+        }
+
+        return { streams: resolved, cacheMaxAge: 6 * 60 * 60 };
+    } catch (err) {
+        error(`[STREAM-CZ] ${type}/${id}: ${err.message}`);
+        return { streams: [] };
+    }
 });
 
 builder.defineMetaHandler(async ({ type, id }) => {
