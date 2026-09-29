@@ -57,7 +57,7 @@ const META_SHORT_TTL_MS = 15 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.5.0",
+    version: "3.6.0",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -348,6 +348,49 @@ async function getCsfdData(imdbId) {
     }
 }
 
+// CZDB někdy vrací staré nebo nulové hodnocení.
+// ČSFD stránka sama obsahuje aktuální hodnotu v .film-rating-average.
+async function getDirectCsfdRating(csfdUrl) {
+    if (!csfdUrl) return null;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+
+    try {
+        const res = await fetch(String(csfdUrl), {
+            headers: {
+                Accept: "text/html,application/xhtml+xml",
+                "User-Agent": "Mozilla/5.0 (compatible; FLYers-StremioAddon/3.6)"
+            },
+            redirect: "follow",
+            signal: controller.signal
+        });
+
+        if (!res.ok) throw new Error(`ČSFD HTTP ${res.status}`);
+
+        const html = await res.text();
+
+        // Aktuální ČSFD používá .film-rating-average.
+        // Záměrně bereme první hodnotu tohoto prvku, nikoliv jiné procento
+        // z textu stránky.
+        const match = html.match(
+            /class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i
+        );
+
+        if (!match) return null;
+
+        const rating = Number(match[1]);
+        return Number.isFinite(rating) && rating >= 0 && rating <= 100
+            ? rating
+            : null;
+    } catch (error) {
+        console.warn(`[ČSFD WEB] ${csfdUrl}: ${error.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 function normalizeRating(value) {
     if (value === null || value === undefined || value === "") return null;
     if (typeof value === "number") return value;
@@ -494,7 +537,18 @@ builder.defineMetaHandler(async ({ type, id }) => {
             getCsfdData(imdbId),
             type === "series" ? getSeriesVideos(imdbId, detail) : Promise.resolve(undefined)
         ]);
-        const csfd = normalizeCsfdData(csfdRaw);
+
+        let csfd = normalizeCsfdData(csfdRaw);
+
+        // Pokud CZDB vrátí 0 / staré hodnocení, načteme aktuální hodnocení
+        // přímo z ČSFD stránky podle csfd_url.
+        if (csfd && csfd.csfdUrl && (!csfd.rating || csfd.rating <= 0)) {
+            const directRating = await getDirectCsfdRating(csfd.csfdUrl);
+            if (directRating !== null) {
+                csfd.rating = directRating;
+            }
+        }
+
         const czechTranslation = getCzechTranslation(detail);
 
         const tmdbDescription =
@@ -508,11 +562,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         if (csfd && csfd.rating !== null && csfd.rating > 0) {
             descriptionParts.push(`⭐ ČSFD: ${csfd.rating} %`);
-            descriptionParts.push("");
         } else if (csfd && csfd.csfdUrl) {
             descriptionParts.push("⭐ ČSFD: zatím bez hodnocení");
-            descriptionParts.push("");
         }
+
+        if (csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined) {
+            descriptionParts.push(`⭐ IMDb: ${csfd.imdbRating}`);
+        }
+
+        if (descriptionParts.length) descriptionParts.push("");
 
         if (csfdDescription) descriptionParts.push(csfdDescription);
         else if (tmdbDescription) descriptionParts.push(tmdbDescription);
