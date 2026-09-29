@@ -58,7 +58,7 @@ const META_SHORT_TTL_MS = 0;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "4.2.5",
+    version: "4.2.6",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -423,7 +423,7 @@ async function getDirectCsfdRating(csfdUrl) {
         const res = await fetch(String(csfdUrl), {
             headers: {
                 Accept: "text/html,application/xhtml+xml",
-                "User-Agent": "Mozilla/5.0 (compatible; FLYers-StremioAddon/3.6)"
+                "User-Agent": "Mozilla/5.0 (compatible; FLYers-StremioAddon/4.2.6)"
             },
             redirect: "follow",
             signal: controller.signal
@@ -433,24 +433,40 @@ async function getDirectCsfdRating(csfdUrl) {
 
         const html = await res.text();
 
-        // Aktuální ČSFD používá .film-rating-average.
-        // Záměrně bereme první hodnotu tohoto prvku, nikoliv jiné procento
-        // z textu stránky.
+        // Nejdřív čteme oficiální JSON-LD aggregateRating z konkrétní stránky filmu.
+        // ČSFD v něm poskytuje ratingValue na stejné stránce jako detail filmu.
+        const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+        for (const block of jsonLdMatches) {
+            const body = block.replace(/^.*?>/, "").replace(/<\/script>\s*$/i, "").trim();
+            try {
+                const data = JSON.parse(body);
+                const items = Array.isArray(data) ? data : [data];
+                for (const item of items) {
+                    const ratingValue = item && item.aggregateRating && item.aggregateRating.ratingValue;
+                    const rating = Number(ratingValue);
+                    if (Number.isFinite(rating) && rating >= 0 && rating <= 100) {
+                        return Math.round(rating);
+                    }
+                }
+            } catch (_) {
+                // Některé stránky mohou mít více JSON-LD bloků nebo nestandardní obsah.
+            }
+        }
+
+        // Záložní parser pro současný HTML prvek ČSFD.
         const patterns = [
             /class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
             /<[^>]*class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
             /film-rating-average[^>]*>[\s\S]{0,80}?([0-9]{1,3})\s*%/i
         ];
-        let match = null;
         for (const pattern of patterns) {
-            match = html.match(pattern);
-            if (match) break;
+            const match = html.match(pattern);
+            if (!match) continue;
+            const rating = Number(match[1]);
+            if (Number.isFinite(rating) && rating >= 0 && rating <= 100) return rating;
         }
-        if (!match) return null;
-        const rating = Number(match[1]);
-        return Number.isFinite(rating) && rating >= 0 && rating <= 100
-            ? rating
-            : null;
+
+        return null;
     } catch (error) {
         console.warn(`[ČSFD WEB] ${csfdUrl}: ${error.message}`);
         return null;
@@ -458,7 +474,6 @@ async function getDirectCsfdRating(csfdUrl) {
         clearTimeout(timer);
     }
 }
-
 function normalizeRating(value) {
     if (value === null || value === undefined || value === "") return null;
     if (typeof value === "number") return value;
@@ -609,11 +624,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
         ]);
 
         let csfd = normalizeCsfdData(csfdRaw);
+        // IMDb je samostatný údaj. Pokud při fallbacku ČSFD nahradíme objekt csfd,
+        // nesmíme tím přijít o IMDb hodnocení, které už máme z CZDB.
+        const preservedImdbRating = csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined
+            ? csfd.imdbRating
+            : null;
 
-        // Fallback: pokud CZDB nenajde vazbu přes IMDb, dohledáme ČSFD přímo
-        // podle názvu a roku. Tím se sjednotí dostupnost ratingu i u titulů,
-        // které v CZDB nemají správně vyplněné IMDb propojení.
-        if (!csfd || !csfd.uid) {
+        // Fallback se spouští i tehdy, když ČSFD vazba existuje, ale nemá rating.
+        // Právě to řeší tituly, u kterých CZDB vrátí ID bez aktuálního hodnocení.
+        if (!csfd || !csfd.uid || csfd.rating === null || csfd.rating <= 0) {
             const titleForSearch =
                 (czechTranslation && czechTranslation.title) ||
                 detail.title ||
@@ -621,12 +640,27 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 found.item.title ||
                 found.item.name ||
                 "";
-            const originalTitle = detail.original_title || detail.original_name || found.item.original_title || found.item.original_name || "";
+            const originalTitle =
+                detail.original_title || detail.original_name ||
+                found.item.original_title || found.item.original_name || "";
             const yearForSearch = String(
-                detail.release_date || detail.first_air_date || found.item.release_date || found.item.first_air_date || ""
+                detail.release_date || detail.first_air_date ||
+                found.item.release_date || found.item.first_air_date || ""
             ).slice(0, 4);
             const searched = await findCsfdByTitle(titleForSearch, yearForSearch, originalTitle);
-            if (searched) csfd = normalizeCsfdData(searched);
+            if (searched) {
+                const searchedCsfd = normalizeCsfdData(searched);
+                if (searchedCsfd) {
+                    if (preservedImdbRating !== null && searchedCsfd.imdbRating === null) {
+                        searchedCsfd.imdbRating = preservedImdbRating;
+                    }
+                    // Prefer the title-search result when the existing CZDB record
+                    // had no usable rating. It gives us a fresh ČSFD ID for the live lookup.
+                    if (!csfd || csfd.rating === null || csfd.rating <= 0) {
+                        csfd = searchedCsfd;
+                    }
+                }
+            }
         }
 
         // ČSFD hodnocení bereme přednostně z aktuálních dat ČSFD podle jejího ID.
