@@ -54,11 +54,11 @@ const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
-const META_SHORT_TTL_MS = 60 * 1000;
+const META_SHORT_TTL_MS = 0;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "4.2.0",
+    version: "4.2.1",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -691,9 +691,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         return {
             meta,
-            cacheMaxAge: 60,
-            staleRevalidate: 60,
-            staleError: 24 * 60 * 60
+            cacheMaxAge: 0,
+            staleRevalidate: 0,
+            staleError: 0
         };
     } catch (error) {
         console.error(`[META] ${type}/${rawId}: ${error.message}`);
