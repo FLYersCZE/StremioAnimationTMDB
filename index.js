@@ -1,17 +1,6 @@
-/*
- * Stremio addon: Animace pro děti (TMDB + ČSFD)
- * Version 4.0.0
- *
- * Změna oproti 3.4.1:
- * - český název a český popis z TMDB translations mají přednost,
- * - CZDB/ČSFD český popis má stále nejvyšší prioritu,
- * - angličtina je až poslední nouzová varianta.
- */
-
 "use strict";
 
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
-const { csfd: csfdApi } = require("node-csfd-api");
 
 const PORT = process.env.PORT || 7000;
 const TMDB_KEY = process.env.TMDB_API_KEY || "";
@@ -50,18 +39,15 @@ const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
 const META_CACHE_MAX = 10000;
+const CINEMETA_META_CACHE_MAX = 10000;
 const ADDON_ID_PREFIX = "flyers:";
-const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
-const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
-const META_SHORT_TTL_MS = 0;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "4.2.6",
-    endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
-    name: "🎬 Animace pro děti (TMDB + ČSFD)",
-    description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
+    version: "3.5.0",
+    name: "🎬 Animace pro děti (TMDB)",
+    description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině.",
     resources: [
         "catalog",
         {
@@ -297,207 +283,42 @@ async function findTmdbByImdb(imdbId) {
 async function getTmdbDetail(kind, tmdbId) {
     return await tmdb(`/${kind}/${tmdbId}`, {
         language: LANGUAGE,
-        append_to_response: "credits,external_ids,translations"
+        append_to_response: "credits,external_ids"
     });
 }
 
-// TMDB někdy vrátí překlady odděleně od hlavního language parametru.
-// Vždy proto zkusíme najít explicitní českou (cs) variantu.
-function getCzechTranslation(detail) {
-    const translations =
-        detail &&
-        detail.translations &&
-        Array.isArray(detail.translations.translations)
-            ? detail.translations.translations
-            : [];
+const cinemetaMetaCache = new Map();
 
-    const candidates = translations.filter(
-        (t) => t && String(t.iso_639_1 || "").toLowerCase() === "cs"
-    );
+async function getCinemetaMeta(imdbId, type) {
+    const cached = cinemetaMetaCache.get(`${type}:${imdbId}`);
+    if (cached && Date.now() - cached.created < STATE_TTL_MS) return cached.value;
 
-    const preferred =
-        candidates.find((t) => String(t.iso_3166_1 || "").toUpperCase() === "CZ") ||
-        candidates[0];
-
-    if (!preferred || !preferred.data) return null;
-
-    return {
-        title: preferred.data.title || preferred.data.name || "",
-        overview: preferred.data.overview || ""
-    };
-}
-
-async function getCsfdData(imdbId) {
-    const url = new URL(`${CZDB_BASE}/search`);
-    url.searchParams.set("i", imdbId);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CZDB_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-        const res = await fetch(url, {
+        const res = await fetch(`${CINEMETA_BASE}/meta/${type}/${imdbId}.json`, {
             headers: { Accept: "application/json" },
             signal: controller.signal
         });
-        if (!res.ok) throw new Error(`CZDB HTTP ${res.status}`);
+        if (!res.ok) return null;
         const data = await res.json();
-        if (!data || data === false) return null;
-        return data;
+        const meta = data && data.meta;
+        if (!meta) return null;
+        if (cinemetaMetaCache.size >= CINEMETA_META_CACHE_MAX) {
+            cinemetaMetaCache.delete(cinemetaMetaCache.keys().next().value);
+        }
+        cinemetaMetaCache.set(`${type}:${imdbId}`, { created: Date.now(), value: meta });
+        return meta;
     } catch (error) {
-        console.warn(`[CZDB] ${imdbId}: ${error.message}`);
+        console.warn(`[CINEMETA META] ${imdbId}: ${error.message}`);
         return null;
     } finally {
         clearTimeout(timer);
     }
 }
 
-// Druhá cesta pro tituly, které CZDB nespojí přes IMDb.
-// ČSFD API umí hledat přímo podle názvu, takže nový nebo hůře propojený titul
-// (např. film, který ještě nemá správnou vazbu v CZDB) dostane stejnou šanci.
-async function findCsfdByTitle(title, year, originalTitle) {
-    const queries = [title, originalTitle].filter(Boolean)
-        .map((v) => String(v).trim())
-        .filter((v, i, a) => a.indexOf(v) === i);
-
-    for (const query of queries) {
-        try {
-            const result = await csfdApi.search(query);
-            const movies = [
-                ...(Array.isArray(result?.movies) ? result.movies : []),
-                ...(Array.isArray(result?.tvSeries) ? result.tvSeries : [])
-            ];
-            if (!movies.length) continue;
-
-            const wantedYear = year ? String(year) : "";
-            const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9áčďéěíňóřšťúůýž ]/gi, "").trim();
-            const exact = movies.find((m) => {
-                const mt = String(m.title || "").toLowerCase().trim();
-                const my = m.year ? String(m.year) : "";
-                return mt === normalizedQuery && (!wantedYear || !my || my === wantedYear);
-            });
-            const sameYear = wantedYear && movies.find((m) => String(m.year || "") === wantedYear);
-            const match = exact || sameYear || movies[0];
-            if (match && match.id) {
-                return {
-                    csfd_id: match.id,
-                    csfd_url: match.url || `https://www.csfd.cz/film/${match.id}/`,
-                    nazev: match.title || title
-                };
-            }
-        } catch (error) {
-            console.warn(`[ČSFD SEARCH] ${query}: ${error.message}`);
-        }
-    }
-    return null;
-}
-
-// Aktuální ČSFD rating získáváme přes ověřenou knihovnu node-csfd-api.
-// CZDB používáme dál pro propojení přes IMDb a pro česká metadata.
-async function getCsfdLibraryData(csfdId) {
-    if (!csfdId) return null;
-    try {
-        const data = await csfdApi.movie(String(csfdId));
-        if (!data || typeof data !== "object") return null;
-        const rating = normalizeRating(data.rating);
-        return {
-            rating,
-            title: data.title || null,
-            description: Array.isArray(data.descriptions) && data.descriptions.length
-                ? String(data.descriptions[0])
-                : null,
-            csfdUrl: data.url || null
-        };
-    } catch (error) {
-        console.warn(`[ČSFD API] ${csfdId}: ${error.message}`);
-        return null;
-    }
-}
-
-// CZDB někdy vrací staré nebo nulové hodnocení.
-// ČSFD stránka sama obsahuje aktuální hodnotu v .film-rating-average.
-async function getDirectCsfdRating(csfdUrl) {
-    if (!csfdUrl) return null;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-
-    try {
-        const res = await fetch(String(csfdUrl), {
-            headers: {
-                Accept: "text/html,application/xhtml+xml",
-                "User-Agent": "Mozilla/5.0 (compatible; FLYers-StremioAddon/4.2.6)"
-            },
-            redirect: "follow",
-            signal: controller.signal
-        });
-
-        if (!res.ok) throw new Error(`ČSFD HTTP ${res.status}`);
-
-        const html = await res.text();
-
-        // Nejdřív čteme oficiální JSON-LD aggregateRating z konkrétní stránky filmu.
-        // ČSFD v něm poskytuje ratingValue na stejné stránce jako detail filmu.
-        const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
-        for (const block of jsonLdMatches) {
-            const body = block.replace(/^.*?>/, "").replace(/<\/script>\s*$/i, "").trim();
-            try {
-                const data = JSON.parse(body);
-                const items = Array.isArray(data) ? data : [data];
-                for (const item of items) {
-                    const ratingValue = item && item.aggregateRating && item.aggregateRating.ratingValue;
-                    const rating = Number(ratingValue);
-                    if (Number.isFinite(rating) && rating >= 0 && rating <= 100) {
-                        return Math.round(rating);
-                    }
-                }
-            } catch (_) {
-                // Některé stránky mohou mít více JSON-LD bloků nebo nestandardní obsah.
-            }
-        }
-
-        // Záložní parser pro současný HTML prvek ČSFD.
-        const patterns = [
-            /class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
-            /<[^>]*class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
-            /film-rating-average[^>]*>[\s\S]{0,80}?([0-9]{1,3})\s*%/i
-        ];
-        for (const pattern of patterns) {
-            const match = html.match(pattern);
-            if (!match) continue;
-            const rating = Number(match[1]);
-            if (Number.isFinite(rating) && rating >= 0 && rating <= 100) return rating;
-        }
-
-        return null;
-    } catch (error) {
-        console.warn(`[ČSFD WEB] ${csfdUrl}: ${error.message}`);
-        return null;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-function normalizeRating(value) {
-    if (value === null || value === undefined || value === "") return null;
-    if (typeof value === "number") return value;
-    const text = String(value).replace(",", ".").replace("%", "").trim();
-    const number = Number(text);
-    return Number.isFinite(number) ? number : null;
-}
-
-function normalizeCsfdData(data) {
-    if (!data || typeof data !== "object") return null;
-
-    const item = Array.isArray(data.results) && data.results.length ? data.results[0] : data;
-    if (!item || typeof item !== "object") return null;
-
-    const rating = normalizeRating(item.hodnoceni);
-    const csfdUrl = item.csfd_url || (item.csfd_id ? `https://www.csfd.cz/film/${item.csfd_id}/` : null);
-    const description = item.popis || null;
-    const title = item.nazev || item.original || null;
-    const uid = item.csfd_id || item.id || null;
-    const imdbRating = normalizeRating(item.imdb_hodnoceni);
-
-    return { rating, csfdUrl, description, title, uid, imdbRating, raw: item };
-}
-
+// Epizody seriálu. Bez pole "videos" Stremio nezobrazí žádné díly a seriál nejde přehrát.
+// ID dílů musí být ve tvaru tt...:řada:díl, aby jim rozuměly doplňky se streamy.
 async function getCinemetaVideos(imdbId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -600,7 +421,13 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 
     try {
-        const found = await findTmdbByImdb(imdbId);
+        // Načítáme Cinemetu současně s TMDB hledáním. U seriálů tak získáme
+        // epizody jedním požadavkem místo dalšího samostatného volání.
+        const [found, cinemetaMeta] = await Promise.all([
+            findTmdbByImdb(imdbId),
+            getCinemetaMeta(imdbId, type)
+        ]);
+
         if (!found) {
             console.warn(`[META] TMDB titul nenalezen: ${id}`);
             return { meta: null };
@@ -616,94 +443,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const detail = await getTmdbDetail(found.kind, found.item.id);
         if (!detail) return { meta: null };
 
-        const czechTranslation = getCzechTranslation(detail);
-
-        const [csfdRaw, videos] = await Promise.all([
-            getCsfdData(imdbId),
-            type === "series" ? getSeriesVideos(imdbId, detail) : Promise.resolve(undefined)
-        ]);
-
-        let csfd = normalizeCsfdData(csfdRaw);
-        // IMDb je samostatný údaj. Pokud při fallbacku ČSFD nahradíme objekt csfd,
-        // nesmíme tím přijít o IMDb hodnocení, které už máme z CZDB.
-        const preservedImdbRating = csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined
-            ? csfd.imdbRating
-            : null;
-
-        // Fallback se spouští i tehdy, když ČSFD vazba existuje, ale nemá rating.
-        // Právě to řeší tituly, u kterých CZDB vrátí ID bez aktuálního hodnocení.
-        if (!csfd || !csfd.uid || csfd.rating === null || csfd.rating <= 0) {
-            const titleForSearch =
-                (czechTranslation && czechTranslation.title) ||
-                detail.title ||
-                detail.name ||
-                found.item.title ||
-                found.item.name ||
-                "";
-            const originalTitle =
-                detail.original_title || detail.original_name ||
-                found.item.original_title || found.item.original_name || "";
-            const yearForSearch = String(
-                detail.release_date || detail.first_air_date ||
-                found.item.release_date || found.item.first_air_date || ""
-            ).slice(0, 4);
-            const searched = await findCsfdByTitle(titleForSearch, yearForSearch, originalTitle);
-            if (searched) {
-                const searchedCsfd = normalizeCsfdData(searched);
-                if (searchedCsfd) {
-                    if (preservedImdbRating !== null && searchedCsfd.imdbRating === null) {
-                        searchedCsfd.imdbRating = preservedImdbRating;
-                    }
-                    // Prefer the title-search result when the existing CZDB record
-                    // had no usable rating. It gives us a fresh ČSFD ID for the live lookup.
-                    if (!csfd || csfd.rating === null || csfd.rating <= 0) {
-                        csfd = searchedCsfd;
-                    }
-                }
-            }
-        }
-
-        // ČSFD hodnocení bereme přednostně z aktuálních dat ČSFD podle jejího ID.
-        // Tím opravíme případy, kdy CZDB vrací 0 nebo zastaralé procento.
-        if (csfd && csfd.uid) {
-            const liveCsfd = await getCsfdLibraryData(csfd.uid);
-            if (liveCsfd && liveCsfd.rating !== null && liveCsfd.rating > 0) {
-                csfd.rating = liveCsfd.rating;
-            }
-            if (liveCsfd && liveCsfd.csfdUrl && !csfd.csfdUrl) {
-                csfd.csfdUrl = liveCsfd.csfdUrl;
-            }
-        }
-
-        // Záložní cesta: pokud knihovna ČSFD rating nezíská, zkusíme přímo HTML stránky.
-        if (csfd && csfd.csfdUrl && (!csfd.rating || csfd.rating <= 0)) {
-            const directRating = await getDirectCsfdRating(csfd.csfdUrl);
-            if (directRating !== null) {
-                csfd.rating = directRating;
-            }
-        }
-
-        const tmdbDescription =
-            (czechTranslation && czechTranslation.overview) ||
-            detail.overview ||
-            found.item.overview ||
-            "";
-
-        const csfdDescription = csfd && csfd.description ? String(csfd.description) : "";
-        const descriptionParts = [];
-
-        // ČSFD řádek je vždy na stejném místě a ve stejném formátu:
-        // procenta → ikonka → ČSFD. Pokud hodnocení není dostupné,
-        // řádek zůstane zachovaný, aby se vzhled jednotlivých titulů nelišil.
-        const csfdRatingText =
-            csfd && csfd.rating !== null && csfd.rating > 0
-                ? `${csfd.rating} %`
-                : "— %";
-        descriptionParts.push(`${csfdRatingText} 🎬 ČSFD`);
-        descriptionParts.push("");
-
-        if (csfdDescription) descriptionParts.push(csfdDescription);
-        else if (tmdbDescription) descriptionParts.push(tmdbDescription);
+        const tmdbDescription = detail.overview || found.item.overview || "";
+        const videos = type === "series"
+            ? (cinemetaMeta && Array.isArray(cinemetaMeta.videos) ? cinemetaMeta.videos : [])
+            : undefined;
 
         const date =
             detail.release_date ||
@@ -721,53 +464,43 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 ? detail.credits.cast.slice(0, 20).map((x) => x && x.name).filter(Boolean)
                 : [];
 
-        const links = [];
-
-        if (csfd && csfd.csfdUrl) {
-            links.push({
-                name: "ČSFD",
-                category: "ČSFD",
-                url: String(csfd.csfdUrl)
-            });
-        }
-
-        links.push({
+        const links = [{
             name: "IMDb",
             category: "IMDb",
             url: `https://www.imdb.com/title/${imdbId}/`
-        });
+        }];
 
         const meta = {
             id: rawId,
             type,
             name:
-                (czechTranslation && czechTranslation.title) ||
-                (csfd && csfd.title) ||
                 detail.title ||
                 detail.name ||
+                (cinemetaMeta && cinemetaMeta.name) ||
                 found.item.title ||
                 found.item.name ||
                 "Neznámý titul",
             poster:
-                detail.poster_path
+                (cinemetaMeta && cinemetaMeta.poster) ||
+                (detail.poster_path
                     ? `${IMG}/w500${detail.poster_path}`
                     : found.item.poster_path
                         ? `${IMG}/w500${found.item.poster_path}`
-                        : undefined,
+                        : undefined),
             posterShape: "poster",
             background:
-                detail.backdrop_path
+                (cinemetaMeta && cinemetaMeta.background) ||
+                (detail.backdrop_path
                     ? `${IMG}/w1280${detail.backdrop_path}`
-                    : undefined,
-            description:
-                descriptionParts.join("\n").trim() ||
-                undefined,
+                    : undefined),
+            description: tmdbDescription || undefined,
             releaseInfo: date ? date.slice(0, 4) : undefined,
+            runtime: detail.runtime || undefined,
             genres,
             cast,
             links,
-            imdbRating: csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined
-                ? String(csfd.imdbRating)
+            imdbRating: cinemetaMeta && cinemetaMeta.imdbRating !== undefined
+                ? String(cinemetaMeta.imdbRating)
                 : undefined,
             videos,
             behaviorHints: type === "movie"
@@ -775,18 +508,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 : undefined
         };
 
-        cacheMeta(cacheKey, meta, META_SHORT_TTL_MS);
+        cacheMeta(cacheKey, meta, STATE_TTL_MS);
 
-        console.log(
-            `[META] OK ${type}/${rawId}` +
-            (csfd ? ` + ČSFD ${csfd.rating || 0}%` : " bez ČSFD")
-        );
+        console.log(`[META] OK ${type}/${rawId}`);
 
         return {
             meta,
-            cacheMaxAge: 0,
-            staleRevalidate: 0,
-            staleError: 0
+            cacheMaxAge: 6 * 60 * 60,
+            staleRevalidate: 24 * 60 * 60,
+            staleError: 7 * 24 * 60 * 60
         };
     } catch (error) {
         console.error(`[META] ${type}/${rawId}: ${error.message}`);
