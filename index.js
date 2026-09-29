@@ -6,7 +6,6 @@ const PORT = process.env.PORT || 7000;
 const TMDB_KEY = process.env.TMDB_API_KEY || "";
 const TMDB = "https://api.themoviedb.org/3";
 const IMG = "https://image.tmdb.org/t/p";
-const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const LANGUAGE = process.env.LANGUAGE || "cs-CZ";
 const MAX_RATING = process.env.MAX_RATING || "PG";
 
@@ -216,6 +215,46 @@ function ensure(state, def, needed) {
 
 const builder = new addonBuilder(manifest);
 
+async function getCzechOverview(imdbId, type) {
+    if (!TMDB_KEY || !imdbId) return null;
+
+    const found = await tmdb(`/find/${encodeURIComponent(imdbId)}`, {
+        external_source: "imdb_id",
+        language: LANGUAGE
+    });
+
+    const item = type === "movie"
+        ? (found && found.movie_results && found.movie_results[0])
+        : (found && found.tv_results && found.tv_results[0]);
+
+    if (!item || !item.id) return null;
+
+    // Nejprve vezmeme detail přímo v češtině. Pokud český překlad existuje,
+    // TMDB vrátí český overview.
+    const detailPath = type === "movie" ? `/movie/${item.id}` : `/tv/${item.id}`;
+    const detail = await tmdb(detailPath, {
+        language: LANGUAGE,
+        append_to_response: "translations"
+    });
+
+    if (detail && detail.overview && detail.overview.trim()) {
+        return detail.overview.trim();
+    }
+
+    // Záloha: najdeme přímo český překlad v seznamu překladů TMDB.
+    const translations = detail && detail.translations && detail.translations.translations;
+    if (Array.isArray(translations)) {
+        const cs = translations.find(t =>
+            t && t.iso_639_1 === "cs" &&
+            (!t.iso_3166_1 || t.iso_3166_1 === "CZ") &&
+            t.data && t.data.overview
+        );
+        if (cs && cs.data.overview.trim()) return cs.data.overview.trim();
+    }
+
+    return null;
+}
+
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     const def = CATALOGS[id];
     if (!def || def.type !== type) return { metas: [] };
@@ -242,25 +281,26 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     };
 });
 
-// Meta handler: zachová původní filmové info z Cinemety a změní pouze popisek na český z TMDB.
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         const cinemetaUrl = `${CINEMETA_BASE}/meta/${type}/${encodeURIComponent(id)}.json`;
-        const cinemetaRes = await fetch(cinemetaUrl);
-        if (!cinemetaRes.ok) return {};
-        const cinemetaData = await cinemetaRes.json();
-        const meta = cinemetaData && cinemetaData.meta ? { ...cinemetaData.meta } : {};
+        const res = await fetch(cinemetaUrl);
+        if (!res.ok) return {};
 
-        if (TMDB_KEY) {
-            const tmdbData = await tmdb(`/find/${encodeURIComponent(id)}`, {
-                external_source: "imdb_id",
-                language: LANGUAGE
-            });
-            const found = type === "movie" ? tmdbData && tmdbData.movie_results && tmdbData.movie_results[0] : tmdbData && tmdbData.tv_results && tmdbData.tv_results[0];
-            if (found && found.overview) meta.description = found.overview;
-        }
+        const data = await res.json();
+        const meta = data && data.meta ? { ...data.meta } : {};
+        if (!meta.id) meta.id = id;
+        if (!meta.type) meta.type = type;
 
-        return { meta, cacheMaxAge: 60 * 60, staleRevalidate: 24 * 60 * 60, staleError: 7 * 24 * 60 * 60 };
+        const czechOverview = await getCzechOverview(id, type);
+        if (czechOverview) meta.description = czechOverview;
+
+        return {
+            meta,
+            cacheMaxAge: 60 * 60,
+            staleRevalidate: 24 * 60 * 60,
+            staleError: 7 * 24 * 60 * 60
+        };
     } catch (error) {
         console.error(`[META] ${type}/${id}: ${error.message}`);
         return {};
