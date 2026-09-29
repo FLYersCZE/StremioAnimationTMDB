@@ -29,21 +29,22 @@ const MAX_BATCHES_PER_REQUEST = 8;
 const MAX_TMDB_PAGES = 500;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
-const PREHRAJTO_TIMEOUT_MS = 5000;
-const CZ_DABING_CANDIDATES = 20;
-const CZ_DABING_CONCURRENCY = 12;
+const PREHRAJTO_TIMEOUT_MS = 8000;
 const PREHRAJTO_USERNAME = process.env.PREHRAJTO_USERNAME || "";
 const PREHRAJTO_PASSWORD = process.env.PREHRAJTO_PASSWORD || "";
-const CZ_DABING_CACHE_MAX = 5000;
-const CZ_DABING_TTL_MS = 6 * 60 * 60 * 1000;
+const STREAM_CACHE_MAX = 2000;
+const STREAM_CACHE_TTL_MS = 30 * 60 * 1000;
+const STREAM_RESOLVE_LIMIT = 5;
 const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 const OVERVIEW_CACHE_MAX = 5000;
 const OVERVIEW_TTL_MS = 12 * 60 * 60 * 1000;
 
+const CZ_DABING_CATALOG_ID = "deti_filmy_cz_dabing_v2";
+
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.1.0",
+    version: "3.1.2",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
     resources: [
@@ -56,7 +57,7 @@ const manifest = {
     behaviorHints: { configurable: false },
     catalogs: [
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
-        { type: "movie", id: "deti_filmy_cz_dabing", name: "🇨🇿 Animované filmy: Český dabing", extra: [{ name: "skip" }] },
+        { type: "movie", id: CZ_DABING_CATALOG_ID, name: "🇨🇿 Animované filmy: Český dabing", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "series", id: "deti_serialy_nove", name: "🆕 Animované seriály: Nejnovější", extra: [{ name: "skip" }] },
         { type: "series", id: "deti_serialy_popularni", name: "📺 Animované seriály: Populární", extra: [{ name: "skip" }] }
@@ -66,7 +67,7 @@ const manifest = {
 const CATALOGS = {
     deti_filmy_popularni: { type: "movie", kind: "movie", sort: "popularity.desc", minVotes: 30 },
     deti_filmy_nove: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 20 },
-    deti_filmy_cz_dabing: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 10 },
+    [CZ_DABING_CATALOG_ID]: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 20 },
     deti_serialy_popularni: { type: "series", kind: "tv", sort: "popularity.desc", minVotes: 30 },
     deti_serialy_nove: { type: "series", kind: "tv", sort: "first_air_date.desc", minVotes: 20 }
 };
@@ -262,39 +263,7 @@ function ensure(state, def, needed) {
     return run;
 }
 
-
-const czDabingCache = new Map();
-
-function czDabingCacheGet(key) {
-    const entry = czDabingCache.get(key);
-    if (!entry) return undefined;
-    if (Date.now() - entry.created > CZ_DABING_TTL_MS) {
-        czDabingCache.delete(key);
-        return undefined;
-    }
-    return entry.value;
-}
-
-function czDabingCacheSet(key, value) {
-    if (czDabingCache.size >= CZ_DABING_CACHE_MAX) {
-        czDabingCache.delete(czDabingCache.keys().next().value);
-    }
-    czDabingCache.set(key, { created: Date.now(), value });
-}
-
-function hasCzechDubbingTitle(title) {
-    const text = String(title || "")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#39;|&apos;/gi, "'")
-        .replace(/&amp;/gi, "&")
-        .toLowerCase();
-
-    // Pouze skutečný dabing. Samotné "CZ" nestačí a české titulky nejsou dabing.
-    if (/(?:cz|cze)[\s._-]*titulky|česk(?:é|e)\s*titulky/.test(text)) return false;
-    if (/(?:^|[\s._\-\[\](){}])(?:cz|cze)[\s._\-:]*dab(?:ing|bed|ín)?(?:[\s._\-\[\](){}]|$)/.test(text)) return true;
-    if (/česk(?:ý|y|á|é)\s*(?:dab(?:ing|bed|ín)?|znění)/.test(text)) return true;
-    return false;
-}
+// ---------- PřeHraj.to ----------
 
 let prehrajtoCookies = null;
 let prehrajtoCookiesAt = 0;
@@ -323,50 +292,50 @@ async function getPrehrajtoHeaders() {
         "Referrer-Policy": "strict-origin-when-cross-origin"
     };
 
-    // Stejně jako CzStreams nejdřív otevřeme PřeHraj.to anonymně a získáme
-    // jeho session cookies. Ty jsou potřeba i bez uživatelského účtu.
     if (prehrajtoCookies && Date.now() - prehrajtoCookiesAt < 8_400_000) {
         return { ...common, Cookie: prehrajtoCookies };
     }
 
-    const home = await fetch("https://prehraj.to/", {
-        headers: common,
-        method: "GET"
-    });
-    const initial = cookieHeader(extractSetCookies(home.headers));
-    let combined = initial;
+    try {
+        const home = await fetch("https://prehraj.to/", { headers: common, method: "GET" });
+        const initial = cookieHeader(extractSetCookies(home.headers));
+        let combined = initial;
 
-    if (PREHRAJTO_USERNAME && PREHRAJTO_PASSWORD) {
-        const form = new URLSearchParams();
-        form.set("email", PREHRAJTO_USERNAME);
-        form.set("password", PREHRAJTO_PASSWORD);
-        form.set("remember_login", "on");
-        form.set("_do", "loginDialog-login-loginForm-submit");
-        form.set("login", "Přihlásit se");
+        if (PREHRAJTO_USERNAME && PREHRAJTO_PASSWORD) {
+            const form = new URLSearchParams();
+            form.set("email", PREHRAJTO_USERNAME);
+            form.set("password", PREHRAJTO_PASSWORD);
+            form.set("remember_login", "on");
+            form.set("_do", "loginDialog-login-loginForm-submit");
+            form.set("login", "Přihlásit se");
 
-        const login = await fetch("https://prehraj.to/?frm=loginDialog-login-loginForm", {
-            method: "POST",
-            headers: {
-                ...common,
-                Accept: "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-                ...(initial ? { Cookie: initial } : {})
-            },
-            body: form.toString()
-        });
+            const login = await fetch("https://prehraj.to/?frm=loginDialog-login-loginForm", {
+                method: "POST",
+                headers: {
+                    ...common,
+                    Accept: "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    ...(initial ? { Cookie: initial } : {})
+                },
+                body: form.toString()
+            });
 
-        const cookies = extractSetCookies(login.headers);
-        combined = cookieHeader([
-            ...(initial ? initial.split(/;\s*/) : []),
-            ...cookies
-        ]);
+            const cookies = extractSetCookies(login.headers);
+            combined = cookieHeader([
+                ...(initial ? initial.split(/;\s*/) : []),
+                ...cookies
+            ]);
+        }
+
+        if (combined) {
+            prehrajtoCookies = combined;
+            prehrajtoCookiesAt = Date.now();
+        }
+        return combined ? { ...common, Cookie: combined } : common;
+    } catch (err) {
+        log(`[CZ-DABING] header fetch: ${err.message}`);
+        return common;
     }
-
-    if (combined) {
-        prehrajtoCookies = combined;
-        prehrajtoCookiesAt = Date.now();
-    }
-    return combined ? { ...common, Cookie: combined } : common;
 }
 
 function decodeHtml(value) {
@@ -376,15 +345,6 @@ function decodeHtml(value) {
         .replace(/&amp;/gi, "&")
         .replace(/&nbsp;/gi, " ")
         .replace(/&#([0-9]+);/g, (_, n) => String.fromCharCode(Number(n)));
-}
-
-function extractVideoTitles(html) {
-    const titles = [];
-    for (const match of String(html || "").matchAll(/<a\b([^>]*class=["'][^"']*\bvideo--link\b[^"']*["'][^>]*)>/gi)) {
-        const titleMatch = match[1].match(/\btitle=["']([^"']*)["']/i);
-        if (titleMatch) titles.push(decodeHtml(titleMatch[1]).trim());
-    }
-    return titles;
 }
 
 function extractVideoResults(html) {
@@ -400,16 +360,28 @@ function extractVideoResults(html) {
     return results;
 }
 
+function hasCzechDubbingTitle(title) {
+    const text = decodeHtml(title).toLowerCase();
+    if (/(?:cz|cze|česk(?:é|e))[\s._-]*titulky/.test(text)) return false;
+    if (/(?:^|[\s._\-\[\](){}])(?:cz|cze)[\s._\-:]*dab(?:ing|bed|ín)?(?:[\s._\-\[\](){}]|$)/.test(text)) return true;
+    if (/(?:^|[\s._\-\[\](){}])dab(?:ing|bed)?[\s._\-:]+(?:cz|cze)(?:[\s._\-\[\](){}]|$)/.test(text)) return true;
+    if (/česk(?:ý|y|á|é|ou|e)\s*(?:dab(?:ing|bed|ín)?|znění)/.test(text)) return true;
+    return false;
+}
+
 async function prehrajtoSearchResults(query, headers) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
     try {
         const url = `https://prehraj.to/hledej/${encodeURIComponent(query)}?vp-page=0`;
         const res = await fetch(url, { headers, signal: controller.signal });
-        if (!res.ok) return null;
+        if (!res.ok) {
+            log(`[CZ-DABING] "${query}": HTTP ${res.status}`);
+            return null;
+        }
         return extractVideoResults(await res.text());
     } catch (err) {
-        log(`[CZ-DABING] search: ${err.message}`);
+        log(`[CZ-DABING] "${query}": ${err.message}`);
         return null;
     } finally {
         clearTimeout(timer);
@@ -442,55 +414,24 @@ async function prehrajtoResolveVideo(path, headers) {
     }
 }
 
-async function prehrajtoSearchTitles(query, headers) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
-    try {
-        const url = `https://prehraj.to/hledej/${encodeURIComponent(query)}?vp-page=0`;
-        const res = await fetch(url, { headers, signal: controller.signal });
-        if (!res.ok) {
-            log(`[CZ-DABING] "${query}": PřeHraj.to HTTP ${res.status}`);
-            return null;
-        }
-        const html = await res.text();
-        return extractVideoTitles(html);
-    } catch (err) {
-        log(`[CZ-DABING] "${query}": ${err.message}`);
-        return null;
-    } finally {
-        clearTimeout(timer);
+const streamCache = new Map();
+
+function streamCacheGet(id) {
+    const entry = streamCache.get(id);
+    if (!entry) return undefined;
+    if (Date.now() - entry.created > STREAM_CACHE_TTL_MS) {
+        streamCache.delete(id);
+        return undefined;
     }
+    return entry.streams;
 }
 
-async function prehrajtoHasCzechDubbing(title, year, quick = false) {
-    const key = String(title).toLowerCase() + "|" + (year || "") + "|" + (quick ? "q" : "f");
-    const cached = czDabingCacheGet(key);
-    if (cached !== undefined) return cached;
-
-    try {
-        const headers = await getPrehrajtoHeaders();
-        const queries = quick ? [title] : (year ? [title + " " + year, title] : [title]);
-        let anySuccess = false;
-
-        for (const query of queries) {
-            const titles = await prehrajtoSearchTitles(query, headers);
-            if (titles === null) continue;
-            anySuccess = true;
-            const result = titles.some(hasCzechDubbingTitle);
-            log("[CZ-DABING] " + title + ": " + (result ? "ANO" : "NE") + " přes \"" + query + "\" (" + titles.slice(0, 5).join(" | ") + ")");
-            if (result) {
-                czDabingCacheSet(key, true);
-                return true;
-            }
-        }
-
-        if (anySuccess) czDabingCacheSet(key, false);
-        return false;
-    } catch (err) {
-        log("[CZ-DABING] " + title + ": " + err.message);
-        return false;
-    }
+function streamCacheSet(id, streams) {
+    if (streamCache.size >= STREAM_CACHE_MAX) streamCache.delete(streamCache.keys().next().value);
+    streamCache.set(id, { created: Date.now(), streams });
 }
+
+// ---------- Builder ----------
 
 const builder = new addonBuilder(manifest);
 
@@ -555,26 +496,11 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
     const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
     log(`Požadavek: ${id} skip=${skip}`);
-    if (id === "deti_filmy_cz_dabing") {
-        // Tento katalog je záměrně úplně stejný jako „Nejnovější“.
-        // Ověření CZ dabingu se provede až po otevření konkrétního filmu
-        // ve stream handleru, takže katalog se nikdy nezasekne na PřeHraj.to.
-        const state = getState("deti_filmy_nove");
-        try {
-            await ensure(state, CATALOGS.deti_filmy_nove, skip + PAGE_SIZE);
-            return {
-                metas: state.items.slice(skip, skip + PAGE_SIZE),
-                cacheMaxAge: 60 * 60,
-                staleRevalidate: 24 * 60 * 60,
-                staleError: 7 * 24 * 60 * 60
-            };
-        } catch (err) {
-            error("[CZ-DABING] " + id + ": " + err.message);
-            return { metas: [], cacheMaxAge: 60 };
-        }
-    }
 
-    const state = getState(id);
+    // CZ dabing katalog sdílí stav s "Nejnovější" a vrací stejný seznam.
+    // Skutečné filtrování CZ dabingu probíhá ve stream handleru.
+    const stateKey = id === CZ_DABING_CATALOG_ID ? "deti_filmy_nove" : id;
+    const state = getState(stateKey);
     let failed = false;
     try {
         await ensure(state, def, skip + PAGE_SIZE);
@@ -595,27 +521,54 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         if (type !== "movie" || !id || !id.startsWith("tt")) return { streams: [] };
 
+        const cached = streamCacheGet(id);
+        if (cached !== undefined) {
+            log(`[STREAM-CZ] ${id}: cache (${cached.length})`);
+            return { streams: cached, cacheMaxAge: 30 * 60 };
+        }
+
         const cinemetaUrl = `${CINEMETA_BASE}/meta/${type}/${encodeURIComponent(id)}.json`;
         const metaRes = await fetch(cinemetaUrl);
         if (!metaRes.ok) return { streams: [] };
         const metaData = await metaRes.json();
-        const title = metaData && metaData.meta && metaData.meta.name;
+        const meta = metaData && metaData.meta;
+        const title = meta && meta.name;
         if (!title) return { streams: [] };
+        const year = (meta.releaseInfo || "").toString().slice(0, 4);
 
         const headers = await getPrehrajtoHeaders();
-        const results = await prehrajtoSearchResults(title, headers);
-        if (!results) return { streams: [] };
 
-        // Tady se provádí skutečný filtr. Dítě se k tomuto ověření dostane
-        // až po otevření filmu; katalog předem nic nekontroluje.
-        const czResults = results.filter(item => hasCzechDubbingTitle(item.title));
-        if (!czResults.length) {
-            log(`[CZ-DABING] ${title}: žádný CZ dabing`);
+        const queries = year ? [`${title} ${year}`, title] : [title];
+        const seen = new Set();
+        const all = [];
+        let anySuccess = false;
+
+        for (const q of queries) {
+            const results = await prehrajtoSearchResults(q, headers);
+            if (results === null) continue;
+            anySuccess = true;
+            for (const r of results) {
+                if (seen.has(r.href)) continue;
+                seen.add(r.href);
+                all.push(r);
+            }
+        }
+
+        if (!anySuccess) {
+            log(`[STREAM-CZ] ${id}: PřeHraj.to nedostupné`);
             return { streams: [] };
         }
 
+        const czResults = all.filter(item => hasCzechDubbingTitle(item.title));
+        log(`[STREAM-CZ] ${title} (${year || "?"}): ${czResults.length}/${all.length} má CZ dabing`);
+
+        if (!czResults.length) {
+            streamCacheSet(id, []);
+            return { streams: [], cacheMaxAge: 30 * 60 };
+        }
+
         const resolved = [];
-        for (const item of czResults.slice(0, 5)) {
+        for (const item of czResults.slice(0, STREAM_RESOLVE_LIMIT)) {
             const video = await prehrajtoResolveVideo(item.href, headers);
             if (video) {
                 resolved.push({
@@ -627,7 +580,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
         }
 
-        return { streams: resolved, cacheMaxAge: 6 * 60 * 60 };
+        streamCacheSet(id, resolved);
+        return { streams: resolved, cacheMaxAge: 30 * 60 };
     } catch (err) {
         error(`[STREAM-CZ] ${type}/${id}: ${err.message}`);
         return { streams: [] };
