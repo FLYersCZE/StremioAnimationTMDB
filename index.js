@@ -6,6 +6,7 @@ const PORT = process.env.PORT || 7000;
 const TMDB_KEY = process.env.TMDB_API_KEY || "";
 const TMDB = "https://api.themoviedb.org/3";
 const IMG = "https://image.tmdb.org/t/p";
+const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const LANGUAGE = process.env.LANGUAGE || "cs-CZ";
 const MAX_RATING = process.env.MAX_RATING || "PG";
 
@@ -28,10 +29,13 @@ const IMDB_CACHE_MAX = 30000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.0",
+    version: "3.0.1",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
-    resources: ["catalog"],
+    resources: [
+        "catalog",
+        { name: "meta", types: ["movie", "series"], idPrefixes: ["tt"] }
+    ],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
     catalogs: [
@@ -236,6 +240,31 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         staleRevalidate: 24 * 60 * 60,
         staleError: 7 * 24 * 60 * 60
     };
+});
+
+// Meta handler: zachová původní filmové info z Cinemety a změní pouze popisek na český z TMDB.
+builder.defineMetaHandler(async ({ type, id }) => {
+    try {
+        const cinemetaUrl = `${CINEMETA_BASE}/meta/${type}/${encodeURIComponent(id)}.json`;
+        const cinemetaRes = await fetch(cinemetaUrl);
+        if (!cinemetaRes.ok) return {};
+        const cinemetaData = await cinemetaRes.json();
+        const meta = cinemetaData && cinemetaData.meta ? { ...cinemetaData.meta } : {};
+
+        if (TMDB_KEY) {
+            const tmdbData = await tmdb(`/find/${encodeURIComponent(id)}`, {
+                external_source: "imdb_id",
+                language: LANGUAGE
+            });
+            const found = type === "movie" ? tmdbData && tmdbData.movie_results && tmdbData.movie_results[0] : tmdbData && tmdbData.tv_results && tmdbData.tv_results[0];
+            if (found && found.overview) meta.description = found.overview;
+        }
+
+        return { meta, cacheMaxAge: 60 * 60, staleRevalidate: 24 * 60 * 60, staleError: 7 * 24 * 60 * 60 };
+    } catch (error) {
+        console.error(`[META] ${type}/${id}: ${error.message}`);
+        return {};
+    }
 });
 
 serveHTTP(builder.getInterface(), { port: PORT });
