@@ -30,12 +30,23 @@ const REQUEST_TIMEOUT_MS = 10000;
 const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
+const META_CACHE_MAX = 10000;
+const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+const META_TTL_MS = 6 * 60 * 60 * 1000;
+
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.0",
+    version: "3.9.0",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
-    resources: ["catalog"],
+    resources: [
+        "catalog",
+        {
+            name: "meta",
+            types: ["movie", "series"],
+            idPrefixes: ["tt"]
+        }
+    ],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
     catalogs: [
@@ -232,6 +243,96 @@ function ensure(state, def, needed) {
     return run;
 }
 
+
+const metaCache = new Map();
+
+function cacheMeta(key, value) {
+    if (metaCache.size >= META_CACHE_MAX) {
+        metaCache.delete(metaCache.keys().next().value);
+    }
+    metaCache.set(key, { created: Date.now(), value });
+}
+
+function getCachedMeta(key) {
+    const entry = metaCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.created > META_TTL_MS) {
+        metaCache.delete(key);
+        return null;
+    }
+    return entry.value;
+}
+
+async function findTmdbByImdb(imdbId) {
+    const data = await tmdb(`/find/${encodeURIComponent(imdbId)}`, {
+        external_source: "imdb_id",
+        language: LANGUAGE
+    });
+    if (!data) return null;
+    if (data.tv_results && data.tv_results.length) {
+        return { kind: "tv", item: data.tv_results[0] };
+    }
+    if (data.movie_results && data.movie_results.length) {
+        return { kind: "movie", item: data.movie_results[0] };
+    }
+    return null;
+}
+
+async function getTmdbDetail(kind, tmdbId) {
+    return await tmdb(`/${kind}/${tmdbId}`, {
+        language: LANGUAGE,
+        append_to_response: "credits,external_ids,translations"
+    });
+}
+
+function getCzechTranslation(detail) {
+    const translations =
+        detail &&
+        detail.translations &&
+        Array.isArray(detail.translations.translations)
+            ? detail.translations.translations
+            : [];
+
+    const candidates = translations.filter(
+        (t) => t && String(t.iso_639_1 || "").toLowerCase() === "cs"
+    );
+
+    const preferred =
+        candidates.find((t) => String(t.iso_3166_1 || "").toUpperCase() === "CZ") ||
+        candidates[0];
+
+    if (!preferred || !preferred.data) return null;
+
+    return {
+        title: preferred.data.title || preferred.data.name || "",
+        overview: preferred.data.overview || ""
+    };
+}
+
+async function getCinemetaMeta(type, imdbId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+        const res = await fetch(`${CINEMETA_BASE}/meta/${type}/${imdbId}.json`, {
+            headers: { Accept: "application/json" },
+            signal: controller.signal
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data && data.meta ? data.meta : null;
+    } catch (error) {
+        console.warn(`[CINEMETA META] ${imdbId}: ${error.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function getCinemetaVideos(imdbId) {
+    const meta = await getCinemetaMeta("series", imdbId);
+    return meta && Array.isArray(meta.videos) ? meta.videos : [];
+}
+
 const builder = new addonBuilder(manifest);
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
@@ -264,6 +365,155 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         staleRevalidate: 24 * 60 * 60,
         staleError: 7 * 24 * 60 * 60
     };
+});
+
+
+builder.defineMetaHandler(async ({ type, id }) => {
+    if (!id || (type !== "movie" && type !== "series")) {
+        return { meta: null };
+    }
+
+    const rawId = String(id);
+    const imdbId = rawId.startsWith("tt") ? rawId : rawId;
+
+    if (!imdbId.startsWith("tt")) return { meta: null };
+
+    const cacheKey = `${type}:${rawId}`;
+    const cached = getCachedMeta(cacheKey);
+    if (cached) {
+        return { meta: cached, cacheMaxAge: META_TTL_MS / 1000 };
+    }
+
+    try {
+        const found = await findTmdbByImdb(imdbId);
+        if (!found) return { meta: null };
+
+        if (
+            (type === "series" && found.kind !== "tv") ||
+            (type === "movie" && found.kind !== "movie")
+        ) {
+            return { meta: null };
+        }
+
+        const detail = await getTmdbDetail(found.kind, found.item.id);
+        if (!detail) return { meta: null };
+
+        const czechTranslation = getCzechTranslation(detail);
+
+        // Cinemeta is used only as an additional metadata source.
+        // No ČSFD/CZDB is used anywhere in this detail handler.
+        const cinemeta = await getCinemetaMeta(type, imdbId);
+        const videos = type === "series"
+            ? (cinemeta && Array.isArray(cinemeta.videos)
+                ? cinemeta.videos
+                : [])
+            : undefined;
+
+        const date =
+            detail.release_date ||
+            detail.first_air_date ||
+            found.item.release_date ||
+            found.item.first_air_date ||
+            "";
+
+        const genres = Array.isArray(detail.genres)
+            ? detail.genres.map((g) => g && g.name).filter(Boolean)
+            : [];
+
+        const cast =
+            detail.credits && Array.isArray(detail.credits.cast)
+                ? detail.credits.cast.slice(0, 20).map((x) => x && x.name).filter(Boolean)
+                : [];
+
+        // These are native Stremio metadata fields. They do not create
+        // any custom UI; Stremio renders them in its own original layout.
+        const director = detail.credits && Array.isArray(detail.credits.crew)
+            ? detail.credits.crew
+                .filter((x) => x && x.job === "Director")
+                .map((x) => x.name)
+                .filter(Boolean)
+                .slice(0, 10)
+            : [];
+
+        const writer = detail.credits && Array.isArray(detail.credits.crew)
+            ? detail.credits.crew
+                .filter((x) => x && (x.job === "Writer" || x.department === "Writing"))
+                .map((x) => x.name)
+                .filter(Boolean)
+                .filter((name, i, a) => a.indexOf(name) === i)
+                .slice(0, 10)
+            : [];
+
+        const links = [
+            {
+                name: "IMDb",
+                category: "IMDb",
+                url: `https://www.imdb.com/title/${imdbId}/`
+            }
+        ];
+
+        const runtimeMinutes =
+            Number(detail.runtime) ||
+            (cinemeta && parseInt(String(cinemeta.runtime || "").match(/\d+/)?.[0] || "", 10)) ||
+            0;
+
+        const imdbRating =
+            cinemeta && cinemeta.imdbRating !== undefined && cinemeta.imdbRating !== null
+                ? String(cinemeta.imdbRating)
+                : undefined;
+
+        const meta = {
+            id: rawId,
+            type,
+            name:
+                (czechTranslation && czechTranslation.title) ||
+                detail.title ||
+                detail.name ||
+                found.item.title ||
+                found.item.name ||
+                "Neznámý titul",
+            poster:
+                detail.poster_path
+                    ? `${IMG}/w500${detail.poster_path}`
+                    : found.item.poster_path
+                        ? `${IMG}/w500${found.item.poster_path}`
+                        : undefined,
+            posterShape: "poster",
+            background:
+                detail.backdrop_path
+                    ? `${IMG}/w1280${detail.backdrop_path}`
+                    : undefined,
+            description:
+                (czechTranslation && czechTranslation.overview) ||
+                detail.overview ||
+                found.item.overview ||
+                undefined,
+            releaseInfo: date ? date.slice(0, 4) : undefined,
+            runtime: runtimeMinutes > 0 ? `${runtimeMinutes} min` : undefined,
+            genres,
+            director: director.length ? director : undefined,
+            cast,
+            writer: writer.length ? writer : undefined,
+            links,
+            imdbRating,
+            videos,
+            behaviorHints: type === "movie"
+                ? { defaultVideoId: imdbId }
+                : undefined
+        };
+
+        cacheMeta(cacheKey, meta);
+
+        return {
+            meta,
+            cacheMaxAge: META_TTL_MS / 1000,
+            staleRevalidate: META_TTL_MS / 1000,
+            staleError: 7 * 24 * 60 * 60
+        };
+    } catch (error) {
+        console.error(`[META] ${type}/${rawId}: ${error.message}`);
+        return { meta: null, cacheMaxAge: 60 };
+    }
 });
 
 serveHTTP(builder.getInterface(), { port: PORT });
