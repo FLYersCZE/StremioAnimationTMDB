@@ -1,6 +1,6 @@
 /*
  * Stremio addon: Animace pro děti (TMDB + ČSFD)
- * Version 3.5.0
+ * Version 4.0.0
  *
  * Změna oproti 3.4.1:
  * - český název a český popis z TMDB translations mají přednost,
@@ -11,6 +11,7 @@
 "use strict";
 
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const { csfd: csfdApi } = require("node-csfd-api");
 
 const PORT = process.env.PORT || 7000;
 const TMDB_KEY = process.env.TMDB_API_KEY || "";
@@ -53,11 +54,11 @@ const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
-const META_SHORT_TTL_MS = 15 * 60 * 1000;
+const META_SHORT_TTL_MS = 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.6.0",
+    version: "4.1.0",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -348,6 +349,28 @@ async function getCsfdData(imdbId) {
     }
 }
 
+// Aktuální ČSFD rating získáváme přes ověřenou knihovnu node-csfd-api.
+// CZDB používáme dál pro propojení přes IMDb a pro česká metadata.
+async function getCsfdLibraryData(csfdId) {
+    if (!csfdId) return null;
+    try {
+        const data = await csfdApi.movie(String(csfdId));
+        if (!data || typeof data !== "object") return null;
+        const rating = normalizeRating(data.rating);
+        return {
+            rating,
+            title: data.title || null,
+            description: Array.isArray(data.descriptions) && data.descriptions.length
+                ? String(data.descriptions[0])
+                : null,
+            csfdUrl: data.url || null
+        };
+    } catch (error) {
+        console.warn(`[ČSFD API] ${csfdId}: ${error.message}`);
+        return null;
+    }
+}
+
 // CZDB někdy vrací staré nebo nulové hodnocení.
 // ČSFD stránka sama obsahuje aktuální hodnotu v .film-rating-average.
 async function getDirectCsfdRating(csfdUrl) {
@@ -373,12 +396,17 @@ async function getDirectCsfdRating(csfdUrl) {
         // Aktuální ČSFD používá .film-rating-average.
         // Záměrně bereme první hodnotu tohoto prvku, nikoliv jiné procento
         // z textu stránky.
-        const match = html.match(
-            /class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i
-        );
-
+        const patterns = [
+            /class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
+            /<[^>]*class=["'][^"']*film-rating-average[^"']*["'][^>]*>\s*([0-9]{1,3})\s*%/i,
+            /film-rating-average[^>]*>[\s\S]{0,80}?([0-9]{1,3})\s*%/i
+        ];
+        let match = null;
+        for (const pattern of patterns) {
+            match = html.match(pattern);
+            if (match) break;
+        }
         if (!match) return null;
-
         const rating = Number(match[1]);
         return Number.isFinite(rating) && rating >= 0 && rating <= 100
             ? rating
@@ -540,8 +568,19 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         let csfd = normalizeCsfdData(csfdRaw);
 
-        // Pokud CZDB vrátí 0 / staré hodnocení, načteme aktuální hodnocení
-        // přímo z ČSFD stránky podle csfd_url.
+        // ČSFD hodnocení bereme přednostně z aktuálních dat ČSFD podle jejího ID.
+        // Tím opravíme případy, kdy CZDB vrací 0 nebo zastaralé procento.
+        if (csfd && csfd.uid) {
+            const liveCsfd = await getCsfdLibraryData(csfd.uid);
+            if (liveCsfd && liveCsfd.rating !== null && liveCsfd.rating > 0) {
+                csfd.rating = liveCsfd.rating;
+            }
+            if (liveCsfd && liveCsfd.csfdUrl && !csfd.csfdUrl) {
+                csfd.csfdUrl = liveCsfd.csfdUrl;
+            }
+        }
+
+        // Záložní cesta: pokud knihovna ČSFD rating nezíská, zkusíme přímo HTML stránky.
         if (csfd && csfd.csfdUrl && (!csfd.rating || csfd.rating <= 0)) {
             const directRating = await getDirectCsfdRating(csfd.csfdUrl);
             if (directRating !== null) {
@@ -560,17 +599,16 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const csfdDescription = csfd && csfd.description ? String(csfd.description) : "";
         const descriptionParts = [];
 
+        // Stremio nemá nativní pole pro ČSFD rating jako má pro IMDb.
+        // Proto zobrazíme ČSFD rating jako samostatný řádek hned pod horním
+        // informačním pruhem (délka / rok / IMDb), ještě před popisem filmu.
         if (csfd && csfd.rating !== null && csfd.rating > 0) {
-            descriptionParts.push(`⭐ ČSFD: ${csfd.rating} %`);
+            descriptionParts.push(`🎬 ČSFD   ${csfd.rating} %`);
+            descriptionParts.push("");
         } else if (csfd && csfd.csfdUrl) {
-            descriptionParts.push("⭐ ČSFD: zatím bez hodnocení");
+            descriptionParts.push("🎬 ČSFD   bez hodnocení");
+            descriptionParts.push("");
         }
-
-        if (csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined) {
-            descriptionParts.push(`⭐ IMDb: ${csfd.imdbRating}`);
-        }
-
-        if (descriptionParts.length) descriptionParts.push("");
 
         if (csfdDescription) descriptionParts.push(csfdDescription);
         else if (tmdbDescription) descriptionParts.push(tmdbDescription);
@@ -645,7 +683,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 : undefined
         };
 
-        cacheMeta(cacheKey, meta, csfd ? STATE_TTL_MS : META_SHORT_TTL_MS);
+        cacheMeta(cacheKey, meta, META_SHORT_TTL_MS);
 
         console.log(
             `[META] OK ${type}/${rawId}` +
@@ -654,9 +692,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         return {
             meta,
-            cacheMaxAge: 6 * 60 * 60,
-            staleRevalidate: 24 * 60 * 60,
-            staleError: 7 * 24 * 60 * 60
+            cacheMaxAge: 60,
+            staleRevalidate: 60,
+            staleError: 24 * 60 * 60
         };
     } catch (error) {
         console.error(`[META] ${type}/${rawId}: ${error.message}`);
