@@ -58,7 +58,7 @@ const META_SHORT_TTL_MS = 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "4.1.0",
+    version: "4.2.0",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
@@ -599,16 +599,15 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const csfdDescription = csfd && csfd.description ? String(csfd.description) : "";
         const descriptionParts = [];
 
-        // Stremio nemá nativní pole pro ČSFD rating jako má pro IMDb.
-        // Proto zobrazíme ČSFD rating jako samostatný řádek hned pod horním
-        // informačním pruhem (délka / rok / IMDb), ještě před popisem filmu.
-        if (csfd && csfd.rating !== null && csfd.rating > 0) {
-            descriptionParts.push(`🎬 ČSFD   ${csfd.rating} %`);
-            descriptionParts.push("");
-        } else if (csfd && csfd.csfdUrl) {
-            descriptionParts.push("🎬 ČSFD   bez hodnocení");
-            descriptionParts.push("");
-        }
+        // ČSFD řádek je vždy na stejném místě a ve stejném formátu:
+        // procenta → ikonka → ČSFD. Pokud hodnocení není dostupné,
+        // řádek zůstane zachovaný, aby se vzhled jednotlivých titulů nelišil.
+        const csfdRatingText =
+            csfd && csfd.rating !== null && csfd.rating > 0
+                ? `${csfd.rating} %`
+                : "— %";
+        descriptionParts.push(`${csfdRatingText} 🎬 ČSFD`);
+        descriptionParts.push("");
 
         if (csfdDescription) descriptionParts.push(csfdDescription);
         else if (tmdbDescription) descriptionParts.push(tmdbDescription);
