@@ -39,11 +39,12 @@ const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
 const META_CACHE_MAX = 10000;
+const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.1.1",
+    version: "3.2.0",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
     resources: [
@@ -51,11 +52,11 @@ const manifest = {
         {
             name: "meta",
             types: ["movie", "series"],
-            idPrefixes: ["tt"]
+            idPrefixes: [ADDON_ID_PREFIX]
         }
     ],
     types: ["movie", "series"],
-    idPrefixes: ["tt"],
+    idPrefixes: [ADDON_ID_PREFIX],
     catalogs: [
         { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
@@ -178,7 +179,7 @@ function isAllowed(item, kind) {
 function toMeta(item, imdbId, type) {
     const date = item.release_date || item.first_air_date || "";
     return {
-        id: imdbId,
+        id: `${ADDON_ID_PREFIX}${imdbId}`,
         type,
         name: item.title || item.name,
         poster: `${IMG}/w342${item.poster_path}`,
@@ -368,18 +369,25 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 });
 
 builder.defineMetaHandler(async ({ type, id }) => {
-    if (!id || !String(id).startsWith("tt") || (type !== "movie" && type !== "series")) {
+    if (!id || (type !== "movie" && type !== "series")) {
         return { meta: null };
     }
 
-    const cacheKey = `${type}:${id}`;
+    const rawId = String(id);
+    const imdbId = rawId.startsWith(ADDON_ID_PREFIX)
+        ? rawId.slice(ADDON_ID_PREFIX.length)
+        : rawId;
+
+    if (!imdbId.startsWith("tt")) return { meta: null };
+
+    const cacheKey = `${type}:${rawId}`;
     const cached = getCachedMeta(cacheKey);
     if (cached) {
         return { meta: cached, cacheMaxAge: 6 * 60 * 60 };
     }
 
     try {
-        const found = await findTmdbByImdb(id);
+        const found = await findTmdbByImdb(imdbId);
         if (!found) {
             console.warn(`[META] TMDB titul nenalezen: ${id}`);
             return { meta: null };
@@ -395,7 +403,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const detail = await getTmdbDetail(found.kind, found.item.id);
         if (!detail) return { meta: null };
 
-        const csfdRaw = await getCsfdData(id);
+        const csfdRaw = await getCsfdData(imdbId);
         const csfd = normalizeCsfdData(csfdRaw);
 
         const tmdbDescription = detail.overview || found.item.overview || "";
@@ -442,11 +450,11 @@ builder.defineMetaHandler(async ({ type, id }) => {
         links.push({
             name: "IMDb",
             category: "IMDb",
-            url: `https://www.imdb.com/title/${id}/`
+            url: `https://www.imdb.com/title/${imdbId}/`
         });
 
         const meta = {
-            id,
+            id: rawId,
             type,
             name:
                 detail.title ||
@@ -471,13 +479,19 @@ builder.defineMetaHandler(async ({ type, id }) => {
             releaseInfo: date ? date.slice(0, 4) : undefined,
             genres,
             cast,
-            links
+            links,
+            imdbRating: csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined
+                ? String(csfd.imdbRating)
+                : undefined,
+            behaviorHints: type === "movie"
+                ? { defaultVideoId: imdbId }
+                : undefined
         };
 
         cacheMeta(cacheKey, meta);
 
         console.log(
-            `[META] OK ${type}/${id}` +
+            `[META] OK ${type}/${rawId}` +
             (csfd ? ` + ČSFD ${csfd.rating || 0}%` : " bez ČSFD")
         );
 
@@ -488,7 +502,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
             staleError: 7 * 24 * 60 * 60
         };
     } catch (error) {
-        console.error(`[META] ${type}/${id}: ${error.message}`);
+        console.error(`[META] ${type}/${rawId}: ${error.message}`);
         return { meta: null, cacheMaxAge: 60 };
     }
 });
