@@ -12,21 +12,13 @@ const MAX_RATING = process.env.MAX_RATING || "PG";
 
 const list = (value, fallback) =>
     (value === undefined ? fallback : value)
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+        .split(",").map((s) => s.trim()).filter(Boolean);
 
 const EXCLUDE_LANGS = list(process.env.EXCLUDE_LANGS, "ja,ko,zh,cn").map((s) => s.toLowerCase());
 const EXCLUDE_COUNTRIES = list(process.env.EXCLUDE_COUNTRIES, "JP,KR,CN,TW,HK").map((s) => s.toUpperCase());
 
-const EXCLUDE_KEYWORDS = process.env.EXCLUDE_KEYWORDS !== undefined
-    ? process.env.EXCLUDE_KEYWORDS
-    : "210024";
-
-const EXCLUDE_TV_GENRES = process.env.EXCLUDE_TV_GENRES !== undefined
-    ? process.env.EXCLUDE_TV_GENRES
-    : "80|10768|9648";
-
+const EXCLUDE_KEYWORDS = process.env.EXCLUDE_KEYWORDS !== undefined ? process.env.EXCLUDE_KEYWORDS : "210024";
+const EXCLUDE_TV_GENRES = process.env.EXCLUDE_TV_GENRES !== undefined ? process.env.EXCLUDE_TV_GENRES : "80|10768|9648";
 const TV_GENRES = process.env.TV_GENRES || "16";
 
 const PAGE_SIZE = 40;
@@ -38,28 +30,14 @@ const REQUEST_TIMEOUT_MS = 10000;
 const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
-const META_CACHE_MAX = 10000;
-const ADDON_ID_PREFIX = "flyers:";
-const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
-const CZDB_TIMEOUT_MS = 4000;
-const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
-const META_SHORT_TTL_MS = 15 * 60 * 1000; // kratší cache, když ČSFD chybí
-
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.6.0",
+    version: "3.0.0",
     name: "🎬 Animace pro děti (TMDB)",
-    description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině.",
-    resources: [
-        "catalog",
-        {
-            name: "meta",
-            types: ["movie", "series"],
-            idPrefixes: [ADDON_ID_PREFIX]
-        }
-    ],
+    description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
+    resources: ["catalog"],
     types: ["movie", "series"],
-    idPrefixes: [ADDON_ID_PREFIX],
+    idPrefixes: ["tt"],
     catalogs: [
         { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
@@ -98,9 +76,7 @@ async function tmdb(path, params = {}) {
     if (IS_V4_TOKEN) headers.Authorization = `Bearer ${TMDB_KEY}`;
     else url.searchParams.set("api_key", TMDB_KEY);
     for (const [k, v] of Object.entries(params)) {
-        if (v !== undefined && v !== null && v !== "") {
-            url.searchParams.set(k, String(v));
-        }
+        if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
     }
 
     let lastError;
@@ -182,7 +158,7 @@ function isAllowed(item, kind) {
 function toMeta(item, imdbId, type) {
     const date = item.release_date || item.first_air_date || "";
     return {
-        id: `${ADDON_ID_PREFIX}${imdbId}`,
+        id: imdbId,
         type,
         name: item.title || item.name,
         poster: `${IMG}/w342${item.poster_path}`,
@@ -216,6 +192,7 @@ async function loadBatch(state, def) {
     const first = state.nextPage;
     const last = Math.min(first + PAGES_PER_BATCH - 1, state.totalPages);
     const pages = Array.from({ length: last - first + 1 }, (_, i) => first + i);
+
     const results = await Promise.all(
         pages.map((p) => tmdb(`/discover/${def.kind}`, discoverParams(def, p)))
     );
@@ -230,6 +207,7 @@ async function loadBatch(state, def) {
     }
 
     const imdbIds = await mapLimit(candidates, 10, (c) => getImdbId(def.kind, c.id));
+
     candidates.forEach((item, i) => {
         const imdb = imdbIds[i];
         if (!imdb || state.seen.has(imdb)) return;
@@ -254,91 +232,6 @@ function ensure(state, def, needed) {
     return run;
 }
 
-const metaCache = new Map();
-
-function cacheMeta(key, value, ttl = STATE_TTL_MS) {
-    if (metaCache.size >= META_CACHE_MAX) metaCache.delete(metaCache.keys().next().value);
-    metaCache.set(key, { created: Date.now(), ttl, value });
-}
-
-function getCachedMeta(key) {
-    const entry = metaCache.get(key);
-    if (!entry) return null;
-    if (Date.now() - entry.created > entry.ttl) {
-        metaCache.delete(key);
-        return null;
-    }
-    return entry.value;
-}
-
-async function findTmdbByImdb(imdbId) {
-    const data = await tmdb(`/find/${encodeURIComponent(imdbId)}`, {
-        external_source: "imdb_id",
-        language: LANGUAGE
-    });
-    if (!data) return null;
-    if (data.tv_results && data.tv_results.length) return { kind: "tv", item: data.tv_results[0] };
-    if (data.movie_results && data.movie_results.length) return { kind: "movie", item: data.movie_results[0] };
-    return null;
-}
-
-async function getTmdbDetail(kind, tmdbId) {
-    return await tmdb(`/${kind}/${tmdbId}`, {
-        language: LANGUAGE,
-        append_to_response: "credits,external_ids"
-    });
-}
-
-async function getCinemetaVideos(imdbId) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-        const res = await fetch(`${CINEMETA_BASE}/meta/series/${imdbId}.json`, {
-            headers: { Accept: "application/json" },
-            signal: controller.signal
-        });
-        if (!res.ok) return [];
-        const data = await res.json();
-        const videos = data && data.meta && data.meta.videos;
-        return Array.isArray(videos) ? videos : [];
-    } catch (error) {
-        console.warn(`[CINEMETA] ${imdbId}: ${error.message}`);
-        return [];
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-async function getTmdbVideos(imdbId, detail) {
-    const seasons = (detail.seasons || []).filter((s) => s && s.season_number > 0);
-    const data = await mapLimit(seasons, 5, (s) =>
-        tmdb(`/tv/${detail.id}/season/${s.season_number}`, { language: LANGUAGE }).catch(() => null)
-    );
-    const videos = [];
-    for (const season of data) {
-        if (!season) continue;
-        for (const ep of season.episodes || []) {
-            const released = ep.air_date ? new Date(ep.air_date) : null;
-            videos.push({
-                id: `${imdbId}:${ep.season_number}:${ep.episode_number}`,
-                title: ep.name || `Epizoda ${ep.episode_number}`,
-                season: ep.season_number,
-                episode: ep.episode_number,
-                released: released && !isNaN(released) ? released.toISOString() : undefined,
-                overview: ep.overview || undefined,
-                thumbnail: ep.still_path ? `${IMG}/w300${ep.still_path}` : undefined
-            });
-        }
-    }
-    return videos;
-}
-
-async function getSeriesVideos(imdbId, detail) {
-    const fromCinemeta = await getCinemetaVideos(imdbId);
-    if (fromCinemeta.length) return fromCinemeta;
-    return await getTmdbVideos(imdbId, detail);
-}
-
 const builder = new addonBuilder(manifest);
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
@@ -355,6 +248,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
     const state = getState(id);
     let failed = false;
+
     try {
         await ensure(state, def, skip + PAGE_SIZE);
     } catch (error) {
@@ -372,123 +266,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     };
 });
 
-builder.defineMetaHandler(async ({ type, id }) => {
-    if (!id || (type !== "movie" && type !== "series")) {
-        return { meta: null };
-    }
-
-    const rawId = String(id);
-    const imdbId = rawId.startsWith(ADDON_ID_PREFIX)
-        ? rawId.slice(ADDON_ID_PREFIX.length)
-        : rawId;
-
-    if (!imdbId.startsWith("tt")) return { meta: null };
-
-    const cacheKey = `${type}:${rawId}`;
-    const cached = getCachedMeta(cacheKey);
-    if (cached) {
-        return { meta: cached, cacheMaxAge: 6 * 60 * 60 };
-    }
-
-    try {
-        const found = await findTmdbByImdb(imdbId);
-        if (!found) {
-            console.warn(`[META] TMDB titul nenalezen: ${id}`);
-            return { meta: null };
-        }
-
-        if (
-            (type === "series" && found.kind !== "tv") ||
-            (type === "movie" && found.kind !== "movie")
-        ) {
-            return { meta: null };
-        }
-
-        const detail = await getTmdbDetail(found.kind, found.item.id);
-        if (!detail) return { meta: null };
-        const videos = type === "series" ? await getSeriesVideos(imdbId, detail) : undefined;
-
-        const tmdbDescription = detail.overview || found.item.overview || "";
-        const description = tmdbDescription || undefined;
-
-        const date =
-            detail.release_date ||
-            detail.first_air_date ||
-            found.item.release_date ||
-            found.item.first_air_date ||
-            "";
-
-        const genres = Array.isArray(detail.genres)
-            ? detail.genres.map((g) => g && g.name).filter(Boolean)
-            : [];
-
-        const cast =
-            detail.credits && Array.isArray(detail.credits.cast)
-                ? detail.credits.cast.slice(0, 20).map((x) => x && x.name).filter(Boolean)
-                : [];
-
-        const links = [];
-
-        links.push({
-            name: "IMDb",
-            category: "IMDb",
-            url: `https://www.imdb.com/title/${imdbId}/`
-        });
-
-        const meta = {
-            id: rawId,
-            type,
-            name:
-                detail.title ||
-                detail.name ||
-                found.item.title ||
-                found.item.name ||
-                "Neznámý titul",
-            poster:
-                detail.poster_path
-                    ? `${IMG}/w500${detail.poster_path}`
-                    : found.item.poster_path
-                        ? `${IMG}/w500${found.item.poster_path}`
-                        : undefined,
-            posterShape: "poster",
-            background:
-                detail.backdrop_path
-                    ? `${IMG}/w1280${detail.backdrop_path}`
-                    : undefined,
-            description:
-                descriptionParts.join("\n").trim() ||
-                undefined,
-            releaseInfo: date ? date.slice(0, 4) : undefined,
-            runtime: detail.runtime || undefined,
-            genres,
-            cast,
-            links,
-            videos,
-            behaviorHints: type === "movie"
-                ? { defaultVideoId: imdbId }
-                : undefined
-        };
-
-        // Když ČSFD chybí (výpadek), drž výsledek jen krátce, ať se brzy zkusí znovu
-        cacheMeta(cacheKey, meta, csfd ? STATE_TTL_MS : META_SHORT_TTL_MS);
-        console.log(`[META] OK ${type}/${rawId}`);
-
-        return {
-            meta,
-            cacheMaxAge: 6 * 60 * 60,
-            staleRevalidate: 24 * 60 * 60,
-            staleError: 7 * 24 * 60 * 60
-        };
-    } catch (error) {
-        console.error(`[META] ${type}/${rawId}: ${error.message}`);
-        return { meta: null, cacheMaxAge: 60 };
-    }
-});
-
 serveHTTP(builder.getInterface(), { port: PORT });
-
 console.log(`Doplněk běží na http://localhost:${PORT}/manifest.json`);
-
-if (!TMDB_KEY) {
-    console.warn("Upozornění: TMDB_API_KEY není nastaven, katalogy budou prázdné.");
-}
+if (!TMDB_KEY) console.warn("Upozornění: TMDB_API_KEY není nastaven, katalogy budou prázdné.");
