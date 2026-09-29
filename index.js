@@ -50,15 +50,15 @@ const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
 const META_CACHE_MAX = 10000;
-const ADDON_ID_PREFIX = "flyers424:";
+const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
 const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const META_SHORT_TTL_MS = 0;
 
 const manifest = {
-    id: "cz.flyerscze.animace.tmdb.v424",
-    version: "4.2.4",
+    id: "cz.flyerscze.animace.tmdb",
+    version: "4.2.5",
     endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
