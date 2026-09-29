@@ -47,7 +47,8 @@ const META_SHORT_TTL_MS = 15 * 60 * 1000; // kratší cache, když ČSFD chybí
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.4.0",
+    version: "3.4.1",
+    endpoint: "https://stremioanimationtmdb.onrender.com/manifest.json",
     name: "🎬 Animace pro děti (TMDB + ČSFD)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině s ČSFD, pokud je dostupný.",
     resources: [
