@@ -29,6 +29,9 @@ const MAX_BATCHES_PER_REQUEST = 8;
 const MAX_TMDB_PAGES = 500;
 const STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
+const PREHRAJTO_TIMEOUT_MS = 7000;
+const CZ_DABING_CACHE_MAX = 5000;
+const CZ_DABING_TTL_MS = 6 * 60 * 60 * 1000;
 const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 const OVERVIEW_CACHE_MAX = 5000;
@@ -36,7 +39,7 @@ const OVERVIEW_TTL_MS = 12 * 60 * 60 * 1000;
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.0.4",
+    version: "3.0.5",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
     resources: [
@@ -48,6 +51,7 @@ const manifest = {
     behaviorHints: { configurable: false },
     catalogs: [
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
+        { type: "movie", id: "deti_filmy_cz_dabing", name: "🇨🇿 Animované filmy: Český dabing", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "series", id: "deti_serialy_nove", name: "🆕 Animované seriály: Nejnovější", extra: [{ name: "skip" }] },
         { type: "series", id: "deti_serialy_popularni", name: "📺 Animované seriály: Populární", extra: [{ name: "skip" }] }
@@ -57,6 +61,7 @@ const manifest = {
 const CATALOGS = {
     deti_filmy_popularni: { type: "movie", kind: "movie", sort: "popularity.desc", minVotes: 30 },
     deti_filmy_nove: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 20 },
+    deti_filmy_cz_dabing: { type: "movie", kind: "movie", sort: "primary_release_date.desc", minVotes: 10 },
     deti_serialy_popularni: { type: "series", kind: "tv", sort: "popularity.desc", minVotes: 30 },
     deti_serialy_nove: { type: "series", kind: "tv", sort: "first_air_date.desc", minVotes: 20 }
 };
@@ -252,6 +257,63 @@ function ensure(state, def, needed) {
     return run;
 }
 
+
+const czDabingCache = new Map();
+
+function czDabingCacheGet(key) {
+    const entry = czDabingCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.created > CZ_DABING_TTL_MS) {
+        czDabingCache.delete(key);
+        return undefined;
+    }
+    return entry.value;
+}
+
+function czDabingCacheSet(key, value) {
+    if (czDabingCache.size >= CZ_DABING_CACHE_MAX) {
+        czDabingCache.delete(czDabingCache.keys().next().value);
+    }
+    czDabingCache.set(key, { created: Date.now(), value });
+}
+
+function hasCzechDubbingTitle(title) {
+    const text = String(title || "").toLowerCase();
+    return /(?:^|[\s._\-\[(])(?:cz|cze)(?:[\s._\-\])]|$)|(?:česk(?:y|ý|á)|cz)\s*dab(?:ing|bed)?|\bcz\s*dab/.test(text);
+}
+
+async function prehrajtoHasCzechDubbing(title, year) {
+    const key = `${String(title).toLowerCase()}|${year || ""}`;
+    const cached = czDabingCacheGet(key);
+    if (cached !== undefined) return cached;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PREHRAJTO_TIMEOUT_MS);
+    try {
+        const query = `${title}${year ? ` ${year}` : ""}`;
+        const url = `https://prehraj.to/hledej/${encodeURIComponent(query)}?vp-page=0`;
+        const res = await fetch(url, {
+            headers: {
+                Accept: "text/html,application/xhtml+xml",
+                "User-Agent": "Mozilla/5.0"
+            },
+            signal: controller.signal
+        });
+        if (!res.ok) return false;
+        const html = await res.text();
+        const titleMatches = [...html.matchAll(/<a[^>]*class=["'][^"']*video--link[^"']*["'][^>]*title=["']([^"']+)["'][^>]*>/gi)]
+            .map(m => m[1]);
+        const result = titleMatches.some(hasCzechDubbingTitle);
+        czDabingCacheSet(key, result);
+        return result;
+    } catch (err) {
+        log(`[CZ-DABING] ${title}: ${err.message}`);
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 const builder = new addonBuilder(manifest);
 
 async function getCzechOverview(imdbId, type) {
@@ -315,6 +377,32 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
     const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
     log(`Požadavek: ${id} skip=${skip}`);
+    if (id === "deti_filmy_cz_dabing") {
+        const baseDef = CATALOGS.deti_filmy_nove;
+        const skip = Math.max(0, parseInt(extra && extra.skip, 10) || 0);
+        const state = getState(id);
+        let failed = false;
+        try {
+            await ensure(state, baseDef, Math.min(skip + PAGE_SIZE, 80));
+            const candidates = state.items.slice(0, Math.min(state.items.length, 80));
+            const checked = await mapLimit(candidates, 4, async (item) => {
+                const year = item.releaseInfo || "";
+                return await prehrajtoHasCzechDubbing(item.name, year) ? item : null;
+            });
+            const metas = checked.filter(Boolean).slice(skip, skip + PAGE_SIZE);
+            return {
+                metas,
+                cacheMaxAge: 6 * 60 * 60,
+                staleRevalidate: 24 * 60 * 60,
+                staleError: 7 * 24 * 60 * 60
+            };
+        } catch (err) {
+            failed = true;
+            error(`[CZ-DABING] ${id}: ${err.message}`);
+            return { metas: [], cacheMaxAge: 60 };
+        }
+    }
+
     const state = getState(id);
     let failed = false;
     try {
