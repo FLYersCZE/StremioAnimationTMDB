@@ -33,10 +33,11 @@ const IMDB_CACHE_MAX = 30000;
 const META_CACHE_MAX = 10000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const META_TTL_MS = 6 * 60 * 60 * 1000;
+const ADDON_ID_PREFIX = "flyersanim:";
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.9.0",
+    version: "4.0.0",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů.",
     resources: [
@@ -44,11 +45,11 @@ const manifest = {
         {
             name: "meta",
             types: ["movie", "series"],
-            idPrefixes: ["tt"]
+            idPrefixes: [ADDON_ID_PREFIX]
         }
     ],
     types: ["movie", "series"],
-    idPrefixes: ["tt"],
+    idPrefixes: [ADDON_ID_PREFIX],
     catalogs: [
         { type: "movie", id: "deti_filmy_popularni", name: "🧸 Animované filmy: Populární", extra: [{ name: "skip" }] },
         { type: "movie", id: "deti_filmy_nove", name: "🆕 Animované filmy: Nejnovější", extra: [{ name: "skip" }] },
@@ -169,7 +170,7 @@ function isAllowed(item, kind) {
 function toMeta(item, imdbId, type) {
     const date = item.release_date || item.first_air_date || "";
     return {
-        id: imdbId,
+        id: `${ADDON_ID_PREFIX}${imdbId}`,
         type,
         name: item.title || item.name,
         poster: `${IMG}/w342${item.poster_path}`,
@@ -374,7 +375,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 
     const rawId = String(id);
-    const imdbId = rawId.startsWith("tt") ? rawId : rawId;
+    const imdbId = rawId.startsWith(ADDON_ID_PREFIX)
+        ? rawId.slice(ADDON_ID_PREFIX.length)
+        : rawId;
 
     if (!imdbId.startsWith("tt")) return { meta: null };
 
