@@ -41,6 +41,9 @@ const IMDB_CACHE_MAX = 30000;
 const META_CACHE_MAX = 10000;
 const ADDON_ID_PREFIX = "flyers:";
 const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
+const CZDB_TIMEOUT_MS = 4000;
+const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+const META_SHORT_TTL_MS = 15 * 60 * 1000; // kratší cache, když ČSFD chybí
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
@@ -253,15 +256,15 @@ function ensure(state, def, needed) {
 
 const metaCache = new Map();
 
-function cacheMeta(key, value) {
+function cacheMeta(key, value, ttl = STATE_TTL_MS) {
     if (metaCache.size >= META_CACHE_MAX) metaCache.delete(metaCache.keys().next().value);
-    metaCache.set(key, { created: Date.now(), value });
+    metaCache.set(key, { created: Date.now(), ttl, value });
 }
 
 function getCachedMeta(key) {
     const entry = metaCache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.created > STATE_TTL_MS) {
+    if (Date.now() - entry.created > entry.ttl) {
         metaCache.delete(key);
         return null;
     }
@@ -291,7 +294,7 @@ async function getCsfdData(imdbId) {
     const url = new URL(`${CZDB_BASE}/search`);
     url.searchParams.set("i", imdbId);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), CZDB_TIMEOUT_MS);
     try {
         const res = await fetch(url, {
             headers: { Accept: "application/json" },
@@ -333,6 +336,58 @@ function normalizeCsfdData(data) {
     const imdbRating = normalizeRating(item.imdb_hodnoceni);
 
     return { rating, csfdUrl, description, title, uid, imdbRating, raw: item };
+}
+
+// Epizody seriálu. Bez pole "videos" Stremio nezobrazí žádné díly a seriál nejde přehrát.
+// ID dílů musí být ve tvaru tt...:řada:díl, aby jim rozuměly doplňky se streamy.
+async function getCinemetaVideos(imdbId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+        const res = await fetch(`${CINEMETA_BASE}/meta/series/${imdbId}.json`, {
+            headers: { Accept: "application/json" },
+            signal: controller.signal
+        });
+        if (!res.ok) return [];
+        const data = await res.json();
+        const videos = data && data.meta && data.meta.videos;
+        return Array.isArray(videos) ? videos : [];
+    } catch (error) {
+        console.warn(`[CINEMETA] ${imdbId}: ${error.message}`);
+        return [];
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function getTmdbVideos(imdbId, detail) {
+    const seasons = (detail.seasons || []).filter((s) => s && s.season_number > 0);
+    const data = await mapLimit(seasons, 5, (s) =>
+        tmdb(`/tv/${detail.id}/season/${s.season_number}`, { language: LANGUAGE }).catch(() => null)
+    );
+    const videos = [];
+    for (const season of data) {
+        if (!season) continue;
+        for (const ep of season.episodes || []) {
+            const released = ep.air_date ? new Date(ep.air_date) : null;
+            videos.push({
+                id: `${imdbId}:${ep.season_number}:${ep.episode_number}`,
+                title: ep.name || `Epizoda ${ep.episode_number}`,
+                season: ep.season_number,
+                episode: ep.episode_number,
+                released: released && !isNaN(released) ? released.toISOString() : undefined,
+                overview: ep.overview || undefined,
+                thumbnail: ep.still_path ? `${IMG}/w300${ep.still_path}` : undefined
+            });
+        }
+    }
+    return videos;
+}
+
+async function getSeriesVideos(imdbId, detail) {
+    const fromCinemeta = await getCinemetaVideos(imdbId);
+    if (fromCinemeta.length) return fromCinemeta;
+    return await getTmdbVideos(imdbId, detail);
 }
 
 const builder = new addonBuilder(manifest);
@@ -403,7 +458,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const detail = await getTmdbDetail(found.kind, found.item.id);
         if (!detail) return { meta: null };
 
-        const csfdRaw = await getCsfdData(imdbId);
+        const [csfdRaw, videos] = await Promise.all([
+            getCsfdData(imdbId),
+            type === "series" ? getSeriesVideos(imdbId, detail) : Promise.resolve(undefined)
+        ]);
         const csfd = normalizeCsfdData(csfdRaw);
 
         const tmdbDescription = detail.overview || found.item.overview || "";
@@ -483,12 +541,14 @@ builder.defineMetaHandler(async ({ type, id }) => {
             imdbRating: csfd && csfd.imdbRating !== null && csfd.imdbRating !== undefined
                 ? String(csfd.imdbRating)
                 : undefined,
+            videos,
             behaviorHints: type === "movie"
                 ? { defaultVideoId: imdbId }
                 : undefined
         };
 
-        cacheMeta(cacheKey, meta);
+        // Když ČSFD chybí (výpadek), drž výsledek jen krátce, ať se brzy zkusí znovu
+        cacheMeta(cacheKey, meta, csfd ? STATE_TTL_MS : META_SHORT_TTL_MS);
 
         console.log(
             `[META] OK ${type}/${rawId}` +
