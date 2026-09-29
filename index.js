@@ -39,13 +39,15 @@ const RETRIES = 2;
 const IMDB_CACHE_MAX = 30000;
 
 const META_CACHE_MAX = 10000;
-const CINEMETA_META_CACHE_MAX = 10000;
 const ADDON_ID_PREFIX = "flyers:";
+const CZDB_BASE = process.env.CZDB_API || "https://api.czdb.cz";
+const CZDB_TIMEOUT_MS = 4000;
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+const META_SHORT_TTL_MS = 15 * 60 * 1000; // kratší cache, když ČSFD chybí
 
 const manifest = {
     id: "cz.flyerscze.animace.tmdb",
-    version: "3.5.0",
+    version: "3.6.0",
     name: "🎬 Animace pro děti (TMDB)",
     description: "Animované filmy a seriály pro děti z TMDB. Bez anime a japonských, korejských a čínských titulů. Detail v češtině.",
     resources: [
@@ -287,38 +289,6 @@ async function getTmdbDetail(kind, tmdbId) {
     });
 }
 
-const cinemetaMetaCache = new Map();
-
-async function getCinemetaMeta(imdbId, type) {
-    const cached = cinemetaMetaCache.get(`${type}:${imdbId}`);
-    if (cached && Date.now() - cached.created < STATE_TTL_MS) return cached.value;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-        const res = await fetch(`${CINEMETA_BASE}/meta/${type}/${imdbId}.json`, {
-            headers: { Accept: "application/json" },
-            signal: controller.signal
-        });
-        if (!res.ok) return null;
-        const data = await res.json();
-        const meta = data && data.meta;
-        if (!meta) return null;
-        if (cinemetaMetaCache.size >= CINEMETA_META_CACHE_MAX) {
-            cinemetaMetaCache.delete(cinemetaMetaCache.keys().next().value);
-        }
-        cinemetaMetaCache.set(`${type}:${imdbId}`, { created: Date.now(), value: meta });
-        return meta;
-    } catch (error) {
-        console.warn(`[CINEMETA META] ${imdbId}: ${error.message}`);
-        return null;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-// Epizody seriálu. Bez pole "videos" Stremio nezobrazí žádné díly a seriál nejde přehrát.
-// ID dílů musí být ve tvaru tt...:řada:díl, aby jim rozuměly doplňky se streamy.
 async function getCinemetaVideos(imdbId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -421,13 +391,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 
     try {
-        // Načítáme Cinemetu současně s TMDB hledáním. U seriálů tak získáme
-        // epizody jedním požadavkem místo dalšího samostatného volání.
-        const [found, cinemetaMeta] = await Promise.all([
-            findTmdbByImdb(imdbId),
-            getCinemetaMeta(imdbId, type)
-        ]);
-
+        const found = await findTmdbByImdb(imdbId);
         if (!found) {
             console.warn(`[META] TMDB titul nenalezen: ${id}`);
             return { meta: null };
@@ -442,11 +406,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         const detail = await getTmdbDetail(found.kind, found.item.id);
         if (!detail) return { meta: null };
+        const videos = type === "series" ? await getSeriesVideos(imdbId, detail) : undefined;
 
         const tmdbDescription = detail.overview || found.item.overview || "";
-        const videos = type === "series"
-            ? (cinemetaMeta && Array.isArray(cinemetaMeta.videos) ? cinemetaMeta.videos : [])
-            : undefined;
+        const description = tmdbDescription || undefined;
 
         const date =
             detail.release_date ||
@@ -464,11 +427,13 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 ? detail.credits.cast.slice(0, 20).map((x) => x && x.name).filter(Boolean)
                 : [];
 
-        const links = [{
+        const links = [];
+
+        links.push({
             name: "IMDb",
             category: "IMDb",
             url: `https://www.imdb.com/title/${imdbId}/`
-        }];
+        });
 
         const meta = {
             id: rawId,
@@ -476,40 +441,36 @@ builder.defineMetaHandler(async ({ type, id }) => {
             name:
                 detail.title ||
                 detail.name ||
-                (cinemetaMeta && cinemetaMeta.name) ||
                 found.item.title ||
                 found.item.name ||
                 "Neznámý titul",
             poster:
-                (cinemetaMeta && cinemetaMeta.poster) ||
-                (detail.poster_path
+                detail.poster_path
                     ? `${IMG}/w500${detail.poster_path}`
                     : found.item.poster_path
                         ? `${IMG}/w500${found.item.poster_path}`
-                        : undefined),
+                        : undefined,
             posterShape: "poster",
             background:
-                (cinemetaMeta && cinemetaMeta.background) ||
-                (detail.backdrop_path
+                detail.backdrop_path
                     ? `${IMG}/w1280${detail.backdrop_path}`
-                    : undefined),
-            description: tmdbDescription || undefined,
+                    : undefined,
+            description:
+                descriptionParts.join("\n").trim() ||
+                undefined,
             releaseInfo: date ? date.slice(0, 4) : undefined,
             runtime: detail.runtime || undefined,
             genres,
             cast,
             links,
-            imdbRating: cinemetaMeta && cinemetaMeta.imdbRating !== undefined
-                ? String(cinemetaMeta.imdbRating)
-                : undefined,
             videos,
             behaviorHints: type === "movie"
                 ? { defaultVideoId: imdbId }
                 : undefined
         };
 
-        cacheMeta(cacheKey, meta, STATE_TTL_MS);
-
+        // Když ČSFD chybí (výpadek), drž výsledek jen krátce, ať se brzy zkusí znovu
+        cacheMeta(cacheKey, meta, csfd ? STATE_TTL_MS : META_SHORT_TTL_MS);
         console.log(`[META] OK ${type}/${rawId}`);
 
         return {
